@@ -1,0 +1,18 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: transcoder training",
+            "type": "debugpy",
+            "python": "/home/is/davide-r/.pyenv/versions/3.12.8/envs/beer/bin/python3",
+            "cwd": "/home/is/davide-r/beer",
+            "request": "launch",
+            "program": "transcoder_training.py",
+            "console": "internalConsole",
+            "justMyCode": true
+        }
+    ]
+}

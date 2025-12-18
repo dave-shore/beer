@@ -1,0 +1,11 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "activate_bash_env",
+            "type": "shell",
+            "command": "/bin/bash", // Use the path to your bash executable
+            "problemMatcher": [],
+        }
+    ]
+}
