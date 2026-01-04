@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 class LightingWrapper(L.LightningModule):
-    def __init__(self, model: torch.nn.Module, ref_model: torch.nn.Module, tokenizer: AutoTokenizer):
+    def __init__(self, model: torch.nn.Module, ref_model: torch.nn.Module, tokenizer: AutoTokenizer, N_masks_per_input: int = 2):
         super().__init__()
         self.model = model
         for param in self.model.parameters():
@@ -39,19 +39,46 @@ class LightingWrapper(L.LightningModule):
             param.requires_grad = False
         self.tokenizer = tokenizer
         self.max_len = self.ref_model.config.max_position_embeddings - 2 if hasattr(self.ref_model.config, "max_position_embeddings") else self.ref_model.config.n_ctx - 2
+        self.mask_token_id = self.tokenizer.mask_token_id
+        self.N_masks_per_input = N_masks_per_input
         
     def compute_loss(self, inputs):
         try:
-            encoded_inputs = self.tokenizer(inputs['input'], padding = "max_length", add_special_tokens = False, max_length = self.max_len, truncation=True, return_tensors = "pt").input_ids
-            outputs = self.model(encoded_inputs)
-            reembedded_inputs = self.model.embed(outputs.argmax(dim = -1))
-            targets = self.ref_model(**encoded_inputs, output_hidden_states = True).hidden_states[-1].to(reembedded_inputs.device)
+            encoded_inputs = self.tokenizer(inputs['input'], padding = "max_length", add_special_tokens = False, max_length = self.max_len, truncation=True, return_tensors = "pt")
+            attention_mask = encoded_inputs.attention_mask
+            random_indices = torch.stack([
+                torch.randint(0, ams.item(), (1,), dtype=torch.long)
+            for ams in attention_mask.sum(dim = 1)]).flatten()
+            one_hot_tensor = torch.nn.functional.one_hot(random_indices, num_classes=encoded_inputs.input_ids.shape[1]).to(dtype = torch.bool)
+            encoded_with_mask = torch.where(one_hot_tensor, encoded_inputs.input_ids.tile(self.N_masks_per_input, 1), self.mask_token_id)
+            
+            # The model must learn the output without masking, but the transcoders must learn the outputs with masking
+            outputs, transcoder_outputs = self.model.get_activations(encoded_inputs.input_ids)
+            reembedded_outputs = self.model.embed(outputs.argmax(dim = -1))
+
+            self.ref_model = self.ref_model.to(encoded_inputs.input_ids.device)
+            targets = self.ref_model(**encoded_inputs, output_hidden_states = True).hidden_states[-1].to(reembedded_outputs.device)
+            targets_with_mask = self.ref_model(encoded_with_mask, attention_mask = attention_mask, output_hidden_states = True).hidden_states[:-1]
+            targets_with_mask = torch.stack(targets_with_mask).to(transcoder_outputs.device)
         except ValueError as e:
             logger.error(f"Error in compute_loss: {e}")
             logger.debug(f"Inputs that caused error: {inputs}")
             raise e
-        min_seq_len = min(reembedded_inputs.shape[1], targets.shape[1])
-        loss = torch.nn.functional.mse_loss(reembedded_inputs[:, :min_seq_len], targets[:, :min_seq_len], reduction = "mean")
+
+        min_seq_len = min(reembedded_outputs.shape[1], targets.shape[1])
+        # Loss for the model to learn the output without masking
+        loss_output = torch.nn.functional.mse_loss(reembedded_outputs[:, :min_seq_len], targets[:, :min_seq_len], reduction = "mean")
+        # Loss for the transcoders to learn the outputs with masking
+        transcoder_outputs_tiled = transcoder_outputs.repeat(1, self.N_masks_per_input, 1, 1)
+        selected_outputs = torch.gather(transcoder_outputs_tiled, dim = 2, index = random_indices.unsqueeze(1).to(transcoder_outputs_tiled.device))
+        selected_targets = torch.gather(targets_with_mask, dim = 2, index = random_indices.unsqueeze(1).to(targets_with_mask.device))
+        try:
+            loss_transcoder = torch.nn.functional.mse_loss(selected_outputs, selected_targets, reduction = "mean")
+        except RuntimeError as e:
+            logger.error(f"Error in compute_loss: {e}\nTensor shapes: {selected_outputs.shape} {selected_targets.shape}")
+            raise e
+        loss = loss_output + loss_transcoder
+
         return loss
 
     def training_step(self, batch, batch_idx):
@@ -62,7 +89,7 @@ class LightingWrapper(L.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=1e-4)
+        return torch.optim.AdamW(self.parameters(), lr=1e-4, weight_decay=1e-4, betas=(0.9, 0.95))
 
 
 def get_model_training_data(model_name):
@@ -152,7 +179,7 @@ def main(model_name: str = "Babelscape/wikineural-multilingual-ner", single_gpu:
 
     logger.info("Initializing ReplacementModel (transducer)")
     transcoder_set = TranscoderSet(
-        {layer_idx: SingleLayerTranscoder(config["d_model"], config["d_model"] * 2, JumpReLU(torch.tensor(0.0), 0.1), layer_idx) for layer_idx in range(config["n_layers"])},
+        {layer_idx: SingleLayerTranscoder(config["d_model"], config["d_model"], JumpReLU(torch.tensor(0.0), 0.1), layer_idx) for layer_idx in range(config["n_layers"])},
         feature_input_hook = "hook_resid_pre",
         feature_output_hook = "hook_mlp_out"
     )
