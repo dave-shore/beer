@@ -1,6 +1,5 @@
 from types import NoneType
-from typing import List
-from transformers import AutoModelForTokenClassification, AutoTokenizer, AutoModelForMaskedLM
+from typing import List, Dict
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 from itertools import combinations, chain
@@ -8,9 +7,14 @@ import pandas as pd
 import json
 from datasets import load_dataset
 from huggingface_hub import HfApi
+from transformers import AutoModelForTokenClassification, AutoTokenizer, AutoModelForMaskedLM
 from tqdm import tqdm
+import gc
+import os
 
 hf_api = HfApi()
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # Handle both relative and absolute imports
 try:
@@ -26,17 +30,20 @@ except ImportError:
     from mbeer.pullback import OutputOnlyModel, pullback
     from mbeer.utils import timing_decorator
 
+@torch.no_grad()
 @timing_decorator
-def forward_backward_pass(batch: List[str], model: AutoModelForTokenClassification, tokenizer: AutoTokenizer):
+def forward_backward_pass(batch: List[str], model: AutoModelForTokenClassification, tokenizer: AutoTokenizer, min_num_eigenvectors: int = 8, max_tokens_per_entity: int = 3, max_retained_vocab: int = 30):
 
     max_len = model.config.max_position_embeddings - 2 if hasattr(model.config, "max_position_embeddings") else model.config.n_ctx - 2
     pred_to_mask = {k:int(v.startswith(('B','I','L','U'))) for k,v in model.config.id2label.items()}
+    device = model.device
+    model_name = model.name_or_path
 
     encoded_inputs = tokenizer(batch, padding = "max_length", add_special_tokens = False, max_length = max_len, truncation=True, return_tensors = "pt")
     attn_mask = encoded_inputs.attention_mask
     row_lens = attn_mask.sum(dim = 1)
 
-    predictions = model(**encoded_inputs).logits.argmax(dim = -1)
+    predictions = model(**encoded_inputs.to(device)).logits.argmax(dim = -1).cpu()
     # predictions.shape = (batch_size, max_len)
 
     # Get the entity spans as (start, end) tuples
@@ -72,7 +79,7 @@ def forward_backward_pass(batch: List[str], model: AutoModelForTokenClassificati
             ]
         for s,o in span_combo_list])))
         if span_combo_list else torch.empty(0, max_len)
-    for encoding, span_combo_list in zip(encoded_inputs.input_ids, span_combinations)])
+    for encoding, span_combo_list in zip(encoded_inputs.input_ids.to("cpu"), span_combinations)])
     # expanded_batch.shape = (batch_size*3*N_combinations(len(spans), 2), max_len)
 
     if expanded_batch.shape[0] == 0:
@@ -81,9 +88,9 @@ def forward_backward_pass(batch: List[str], model: AutoModelForTokenClassificati
     # Get the ids of the tokens that are perturbed for each input sentence
     eq_class_emb_ids = list(chain(*[
         [
-            torch.arange(o[0], o[1]).reshape(-1,1),
-            torch.arange(s[0], s[1]).reshape(-1,1),
-            torch.cat([torch.arange(s[0], s[1]).reshape(-1,1), torch.arange(o[0],o[1]).reshape(-1,1)]),
+            torch.randint(o[0], o[1], (min(o[1]-o[0], max_tokens_per_entity),)).reshape(-1,1),
+            torch.randint(s[0], s[1], (min(s[1]-s[0], max_tokens_per_entity),)).reshape(-1,1),
+            torch.cat([torch.randint(s[0], s[1], (min(s[1]-s[0], max_tokens_per_entity),)).reshape(-1,1), torch.randint(o[0], o[1], (min(o[1]-o[0], max_tokens_per_entity),)).reshape(-1,1)]),
         ]
     for span_combo_list in span_combinations for s,o in span_combo_list]))
     eq_class_emb_ids = torch.nn.utils.rnn.pad_sequence(eq_class_emb_ids, batch_first = True, padding_value = -1).squeeze(-1)
@@ -91,67 +98,174 @@ def forward_backward_pass(batch: List[str], model: AutoModelForTokenClassificati
 
     pred_ids = list(chain(*[
         [
-            torch.arange(s[0], s[1]).reshape(-1,1),
-            torch.arange(o[0], o[1]).reshape(-1,1),
-            torch.cat([torch.arange(s[0], s[1]).reshape(-1,1), torch.arange(o[0],o[1]).reshape(-1,1)]),
+            torch.randint(s[0], s[1], (min(s[1]-s[0], max_tokens_per_entity),)).reshape(-1,1),
+            torch.randint(o[0], o[1], (min(o[1]-o[0], max_tokens_per_entity),)).reshape(-1,1),
+            torch.cat([torch.randint(s[0], s[1], (min(s[1]-s[0], max_tokens_per_entity),)).reshape(-1,1), torch.randint(o[0], o[1], (min(o[1]-o[0], max_tokens_per_entity),)).reshape(-1,1)]),
         ]
     for span_combo_list in span_combinations for s,o in span_combo_list]))
     pred_ids = torch.nn.utils.rnn.pad_sequence(pred_ids, batch_first = True, padding_value = -1).squeeze(-1)
     # pred_ids.shape = (batch_size*3*N_combinations(len(spans), 2), max_perturbed_entity_spans_length)
+
+    separators = list(chain(*[
+        [
+            s[1] - s[0],
+            o[1] - o[0],
+            s[1] - s[0]
+        ]
+    for span_combo_list in span_combinations for s,o in span_combo_list]))
 
     repetitions = torch.tensor([3*len(span_combo_list) for span_combo_list in span_combinations])
     selected_vocab = torch.cat([
         torch.cat([
             encoding[s[0]:s[1]],
             encoding[o[0]:o[1]]
-        ]) for encoding, span_combo_list in zip(encoded_inputs.input_ids, span_combinations) for s,o in span_combo_list
+        ]) for encoding, span_combo_list in zip(encoded_inputs.input_ids.to("cpu"), span_combinations) for s,o in span_combo_list
     ]).unique().reshape(1,1,-1)
-
+    if selected_vocab.shape[-1] > max_retained_vocab:
+        selected_vocab = selected_vocab[..., torch.randperm(selected_vocab.shape[-1])[:max_retained_vocab]]
+    else:
+        selected_vocab = torch.cat([
+            selected_vocab,
+            torch.randint(0, model.config.vocab_size, (selected_vocab.shape[0], selected_vocab.shape[1], max_retained_vocab - selected_vocab.shape[-1]))
+        ], dim = -1)
+    selected_vocab = selected_vocab[..., :max_retained_vocab]
     repeated_attn_mask = attn_mask.repeat_interleave(repetitions, dim = 0)
 
     assert expanded_batch.shape[0] == eq_class_emb_ids.shape[0] == pred_ids.shape[0] == repeated_attn_mask.shape[0]
     local_dataset = TensorDataset(expanded_batch, eq_class_emb_ids, pred_ids, repeated_attn_mask)
 
-    dataloader = DataLoader(local_dataset, batch_size = 2, shuffle = False, pin_memory = True)
+    dataloader = DataLoader(local_dataset, batch_size = 2, shuffle = False, pin_memory = True, num_workers = 8)
     parent_model_info = hf_api.model_info(model.name_or_path)
     parent_model_name = parent_model_info.card_data.get("base_model", None)
+    del model
+    torch.cuda.empty_cache()
 
-    if parent_model_name is None:
-        output_only_model = OutputOnlyModel(AutoModelForMaskedLM.from_pretrained(model.name_or_path).to(model.device))
+    if parent_model_name is not None:
+        output_only_model = OutputOnlyModel(AutoModelForMaskedLM.from_pretrained(parent_model_name).to(device, dtype = torch.float16))
     else:
-        output_only_model = OutputOnlyModel(AutoModelForMaskedLM.from_pretrained(parent_model_name).to(model.device))
+        output_only_model = OutputOnlyModel(AutoModelForMaskedLM.from_pretrained(model_name).to(device, dtype = torch.float16))
+        are_weights_initialized ={k:all(torch.all(p.diff() == 0) for n,p in v.named_parameters() if "bias" in n) for k,v in output_only_model.model.named_modules()}
+        uninitialized_modules = [k for k,v in are_weights_initialized.items() if v]
+        uninitialized_parameters = [p for v in uninitialized_modules for p in output_only_model.model.get_submodule(v).parameters()]
+
+        if len(uninitialized_modules) > 0:
+            with torch.enable_grad():
+                for module in uninitialized_modules:
+                    output_only_model.model.get_submodule(module).train()
+
+                # One step of gradient descent
+                loss_fn = torch.nn.CrossEntropyLoss(reduction = "mean")
+                optimizer = torch.optim.LBFGS(uninitialized_parameters, lr = 1e-3, history_size = 10, max_iter = 10)
+                
+                def closure():
+                    optimizer.zero_grad()
+                    y = output_only_model.model(**encoded_inputs.to(device)).logits
+                    loss = loss_fn(
+                        torch.nn.functional.one_hot(encoded_inputs.input_ids.to(device), num_classes = output_only_model.model.config.vocab_size).to(y.device, dtype = y.dtype),
+                        torch.nn.functional.softmax(y, dim = -1),
+                    )
+                    loss.backward()
+                    return loss
+                optimizer.step(closure)
+
+            optimizer.zero_grad(set_to_none = True)
+            del optimizer
+
+            for module in uninitialized_modules:
+                output_only_model.model.get_submodule(module).eval()
+
+    final_outputs = {
+        "traces": [], 
+        "eigenvectors": [], 
+        "predictions": [],
+        "separators": separators
+    }
+
+    del encoded_inputs, predictions
+    torch.cuda.empty_cache()
+    gc.collect()
 
     for minibatch in tqdm(dataloader):
+
         minibatch_inputs, minibatch_eq_class_emb_ids, minibatch_pred_ids, minibatch_attn_mask = minibatch
-        minibatch_inputs = minibatch_inputs.to(model.device, dtype = torch.long)
+        minibatch_inputs = minibatch_inputs.to(device, dtype = torch.int32)
         minibatch_eq_class_emb_ids = [
-            [v.item() for v in row if v >= 0]
+            row[row >= 0].tolist()
         for row in minibatch_eq_class_emb_ids]
         minibatch_pred_ids = [
-            [v.item() for v in row if v >= 0]
+            row[row >= 0].tolist()
         for row in minibatch_pred_ids]
-        minibatch_attn_mask = minibatch_attn_mask.to(model.device, dtype = torch.bool)
-        selected_vocab = selected_vocab.tile(minibatch_inputs.shape[0], minibatch_inputs.shape[1], 1)
+        minibatch_attn_mask = minibatch_attn_mask.to(device, dtype = torch.bool)
+        minibatch_selected_vocab = selected_vocab.to(device, dtype = torch.int32).expand(minibatch_inputs.shape[0], minibatch_inputs.shape[1], -1)
 
-        if hasattr(model.base_model, "embeddings"):
-            input_embeddings = model.base_model.embeddings(minibatch_inputs)
+        if hasattr(output_only_model.model.base_model, "embeddings"):
+            input_embeddings = output_only_model.model.base_model.embeddings(minibatch_inputs)
+        elif hasattr(output_only_model.model.base_model, "embed_tokens"):
+            input_embeddings = output_only_model.model.base_model.embed_tokens(minibatch_inputs)
         else:
-            input_embeddings = model.base_model.embed_tokens(minibatch_inputs)
+            raise AttributeError("Model has neither embeddings nor embed_tokens")
         # input_embeddings.shape = (batch_size*3*N_combinations(len(spans), 2), max_len, embedding_size)
 
-        pullback_traces, diverging_eigenvectors = pullback(
+        g = torch.eye(selected_vocab.shape[-1], device = input_embeddings.device, dtype = input_embeddings.dtype)
+        g = g.unsqueeze(0).unsqueeze(0).expand(input_embeddings.shape[0], max(map(len, minibatch_pred_ids))*max(map(len, minibatch_eq_class_emb_ids)), -1, -1)
+
+        pullback_traces, diverging_eigenvectors, predictions = pullback(
             input_embeddings,
-            g = torch.eye(model.config.hidden_size, device = input_embeddings.device),
+            g = g,
             model = output_only_model,
             eq_class_emb_ids = minibatch_eq_class_emb_ids,
             pred_id = minibatch_pred_ids,
-            select = selected_vocab,
+            select = minibatch_selected_vocab,
             attention_mask = minibatch_attn_mask,
-            return_trace = True
+            return_trace = True,
+            return_predictions = True,
+            min_num_eigenvectors = min_num_eigenvectors
         )
         tqdm.write(f"Pullback traces shape: {pullback_traces.shape}")
         tqdm.write(f"Diverging eigenvectors shape: {diverging_eigenvectors.shape}")
+        # For eigenvectors, we expect dimensions 1 and 3 to change at each minibatch, so we set a minimum number of eigenvectors to take
+        if diverging_eigenvectors.shape[-1] >= min_num_eigenvectors:
+            diverging_eigenvectors = diverging_eigenvectors[...,:min_num_eigenvectors]
+        else:
+            diverging_eigenvectors = torch.cat([
+                diverging_eigenvectors,
+                torch.zeros(diverging_eigenvectors.shape[0], diverging_eigenvectors.shape[1], diverging_eigenvectors.shape[2], min_num_eigenvectors - diverging_eigenvectors.shape[-1], device = diverging_eigenvectors.device, dtype = diverging_eigenvectors.dtype)
+            ], dim = -1)
 
+        final_outputs["traces"].append(pullback_traces.cpu())
+        final_outputs["eigenvectors"].append(diverging_eigenvectors.flatten(start_dim = -2).cpu())
+        # Remember to reshape the eigenvectors back to the original shape, since now the last dimension is embedding_size * min_num_eigenvectors
+        final_outputs["predictions"].append(predictions.cpu())
+
+        del minibatch_inputs, minibatch_eq_class_emb_ids, minibatch_pred_ids, minibatch_attn_mask, minibatch_selected_vocab, input_embeddings, g
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    # Outputs must be of shape (len(batch)*N_combinations(len(spans), 2), 3, ...)
+    final_outputs = {
+        k:torch.stack(
+            torch.nn.utils.rnn.pad_sequence(v, batch_first = True, padding_value = 0).split(3) 
+        , dim = 1)
+    for k,v in final_outputs.items()}
+
+    return final_outputs
+
+@torch.no_grad()
+@timing_decorator
+def compute_mutual_information(traces: torch.Tensor, predictions: torch.Tensor, separators: List[int], p_minkowski: float = 2.0):
+
+    # Inputs of shape (len(batch)*N_combinations(len(spans), 2), 3, ...)
+    num_per_token_traces = predictions[:,0] * traces[:,1] + predictions[:,1] * traces[:,0]
+    den_Pi = torch.nn.utils.rnn.pad_sequence([p[:s] for p,s in zip(predictions, separators)])
+    den_Pj = torch.nn.utils.rnn.pad_sequence([p[s:] for p,s in zip(predictions, separators)])
+    den_Tij = torch.nn.utils.rnn.pad_sequence([T[:s] for T,s in zip(traces, separators)])
+    den_Tji = torch.nn.utils.rnn.pad_sequence([T[s:] for T,s in zip(traces, separators)])
+    den_per_token_traces = den_Pi * den_Tij + den_Pj * den_Tji
+
+    agg_num = num_per_token_traces.pow(p_minkowski).prod(dim = -2).sum(dim = -1).pow(1/p_minkowski) / (num_per_token_traces.shape[-1] * num_per_token_traces.shape[-2])
+    agg_den = den_per_token_traces.pow(p_minkowski).prod(dim = -2).sum(dim = -1).pow(1/p_minkowski) / (den_per_token_traces.shape[-1] * den_per_token_traces.shape[-2])
+
+    return agg_num / agg_den
 
 @timing_decorator
 def main():
@@ -165,7 +279,10 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     ex = df["input"].sample(4).tolist()
-    forward_backward_pass(ex, model, tokenizer)
+    pullback_dict =forward_backward_pass(ex, model, tokenizer)
+
+    mi = compute_mutual_information(pullback_dict["traces"], pullback_dict["predictions"], pullback_dict["separators"])
+    print(mi)
 
 if __name__ == "__main__":
     main()

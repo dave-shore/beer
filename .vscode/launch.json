@@ -16,13 +16,13 @@
         },
         {
             "name": "Python: scoring",
-            "type": "debugpy",
-            "python": "/home/is/davide-r/.pyenv/versions/3.12.8/envs/beer/bin/python3",
-            "cwd": "/home/is/davide-r/beer",
-            "request": "launch",
-            "program": "src/mbeer/scoring.py",
-            "console": "internalConsole",
-            "justMyCode": true
+            "type": "python",
+            "request": "attach",
+            "connect": {
+                "host": "elm44",
+                "port": 5678
+            },
+            "justMyCode": false
         }
     ]
 }
