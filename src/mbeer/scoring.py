@@ -1,10 +1,12 @@
 from types import NoneType
-from typing import List, Dict
+from typing import Any, List, Dict
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 from itertools import combinations, chain
 import pandas as pd
 import json
+from math import sqrt, log
+from scipy.stats import chi2
 from datasets import load_dataset
 from huggingface_hub import HfApi
 from transformers import AutoModelForTokenClassification, AutoTokenizer, AutoModelForMaskedLM
@@ -30,24 +32,64 @@ except ImportError:
     from mbeer.pullback import OutputOnlyModel, pullback
     from mbeer.utils import timing_decorator
 
+
+def pad_traces_and_eigenvectors(L: List[torch.Tensor]) -> torch.Tensor:
+
+    shapes = [t.shape for t in L]
+    dims = {len(s) for s in shapes}
+    dim = max(dims)
+    if len(dims) > 1:
+        try:
+            force_shape = next(s for s in shapes if len(s) == dim)
+            L = [T.reshape((s if s in force_shape else -1 for s in T.shape)) for T in L]
+        except:
+            raise ValueError("All tensors must have the same number of dimensions or be reshapeable to the same number of dimensions")
+
+    if dim < 3:
+        return torch.nn.utils.rnn.pad_sequence([T.unsqueeze(-1) for T in L], batch_first = True, padding_value = 0)
+
+    padding_shape = tuple(max(along_dim) for along_dim in zip(*shapes))
+
+    for i,T in enumerate(L):
+        if i % 3:
+            # For pairs (j,i), with i < j, we pad the left side of the output dim (dim 1) and the right side of the input dim (dim 2)
+            left_padding = tuple(chain.from_iterable([[padding_shape[j]-T.shape[j],0] if j % 2 else [0,padding_shape[j]-T.shape[j]] for j in range(len(T.shape))][::-1]))
+            T = torch.nn.functional.pad(T, left_padding).to(dtype = torch.float16)
+        else:
+            # For pairs (j,i), with i > j, we pad the right side of the output dim (dim 1) and the left side of the input dim (dim 2)
+            right_padding = tuple(chain.from_iterable([[0,padding_shape[j]-T.shape[j]] if j % 2 else [padding_shape[j]-T.shape[j],0] for j in range(len(T.shape))][::-1]))
+            T = torch.nn.functional.pad(T, right_padding).to(dtype = torch.float16)
+
+        # For tensors that combine two entities it doesn't matter, we treat them as left-padded
+        L[i] = T
+
+    return torch.cat(L)
+    
+
+
 @torch.no_grad()
 @timing_decorator
 def forward_backward_pass(batch: List[str], model: AutoModelForTokenClassification, tokenizer: AutoTokenizer, min_num_eigenvectors: int = 8, max_tokens_per_entity: int = 3, max_retained_vocab: int = 30):
 
     max_len = model.config.max_position_embeddings - 2 if hasattr(model.config, "max_position_embeddings") else model.config.n_ctx - 2
-    pred_to_mask = {k:int(v.startswith(('B','I','L','U'))) for k,v in model.config.id2label.items()}
+    pred_to_mask = {k:int(v.startswith(('B','I','L','U'))) for k,v in model.config.id2label.items()} if hasattr(model.config, "id2label") else {}
     device = model.device
     model_name = model.name_or_path
 
     encoded_inputs = tokenizer(batch, padding = "max_length", add_special_tokens = False, max_length = max_len, truncation=True, return_tensors = "pt")
     attn_mask = encoded_inputs.attention_mask
     row_lens = attn_mask.sum(dim = 1)
+    num_labels = len(pred_to_mask) if pred_to_mask else 3
+    # Threshold from power of Chi-Squared test for uniformity of distribution
+    probit_threshold = 1 / num_labels + sqrt(chi2.sf(0.95, num_labels - 1) / num_labels)
 
-    predictions = model(**encoded_inputs.to(device)).logits.argmax(dim = -1).cpu()
+    logit_threshold = torch.nn.Sequential(torch.nn.Softmax(dim = -1), torch.nn.Threshold(probit_threshold, 0))
+
+    predictions = logit_threshold(model(**encoded_inputs.to(device)).logits).argmax(dim = -1).cpu()
     # predictions.shape = (batch_size, max_len)
 
     # Get the entity spans as (start, end) tuples
-    pred_mask = predictions.apply_(pred_to_mask.get)
+    pred_mask = predictions.apply_(pred_to_mask.get) if pred_to_mask else torch.where(predictions > 0, 1, 0)
     ent_spans = [
         torch.diff(seq, prepend = torch.tensor([0])).nonzero(as_tuple = False)
     for seq in pred_mask]
@@ -134,7 +176,7 @@ def forward_backward_pass(batch: List[str], model: AutoModelForTokenClassificati
     assert expanded_batch.shape[0] == eq_class_emb_ids.shape[0] == pred_ids.shape[0] == repeated_attn_mask.shape[0]
     local_dataset = TensorDataset(expanded_batch, eq_class_emb_ids, pred_ids, repeated_attn_mask)
 
-    dataloader = DataLoader(local_dataset, batch_size = 2, shuffle = False, pin_memory = True, num_workers = 8)
+    dataloader = DataLoader(local_dataset, batch_size = 2, shuffle = False, pin_memory = True, num_workers = 2)
     parent_model_info = hf_api.model_info(model.name_or_path)
     parent_model_name = parent_model_info.card_data.get("base_model", None)
     del model
@@ -190,10 +232,10 @@ def forward_backward_pass(batch: List[str], model: AutoModelForTokenClassificati
         minibatch_inputs, minibatch_eq_class_emb_ids, minibatch_pred_ids, minibatch_attn_mask = minibatch
         minibatch_inputs = minibatch_inputs.to(device, dtype = torch.int32)
         minibatch_eq_class_emb_ids = [
-            row[row >= 0].tolist()
+            row[row >= 0].unique().tolist()
         for row in minibatch_eq_class_emb_ids]
         minibatch_pred_ids = [
-            row[row >= 0].tolist()
+            row[row >= 0].unique().tolist()
         for row in minibatch_pred_ids]
         minibatch_attn_mask = minibatch_attn_mask.to(device, dtype = torch.bool)
         minibatch_selected_vocab = selected_vocab.to(device, dtype = torch.int32).expand(minibatch_inputs.shape[0], minibatch_inputs.shape[1], -1)
@@ -244,7 +286,7 @@ def forward_backward_pass(batch: List[str], model: AutoModelForTokenClassificati
     # Outputs must be of shape (len(batch)*N_combinations(len(spans), 2), 3, ...)
     final_outputs = {
         k:torch.stack(
-            torch.nn.utils.rnn.pad_sequence(v, batch_first = True, padding_value = 0).split(3) 
+            pad_traces_and_eigenvectors(v).split(3) 
         , dim = 1)
     for k,v in final_outputs.items()}
 
@@ -274,7 +316,7 @@ def main():
     df = pd.DataFrame([json.loads(d['text']) for d in data]).map(lambda x: x['name'] if isinstance(x, dict) else " ".join(x) if isinstance(x, list) else x)
     df.rename(columns = {"token": "input", "relation": "label"}, inplace = True)
 
-    model_name = "Babelscape/wikineural-multilingual-ner"
+    model_name = "rv2307/electra-small-ner"
     model = AutoModelForTokenClassification.from_pretrained(model_name).to(device)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 

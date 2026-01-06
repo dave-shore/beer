@@ -12,6 +12,9 @@ class OutputOnlyModel(torch.nn.Module):
         super().__init__()
         self.model = model
 
+        self.module_signatures = {n:signature(module.forward) for n,module in self.model.base_model.named_children()}
+        self.lm_head = torch.nn.Sequential(*[getattr(self.model, n, torch.nn.Identity()) for n in [n for n,module in self.model.named_children() if n in ["classifier", "cls", "generator_lm_head", "generator_predictions"]]])
+
     def forward(self, X: torch.Tensor, pred_id: List[int] = None, select: torch.Tensor = None, attention_mask = None, given_predictions: torch.Tensor = None):
         if hasattr(self.model, "base_model"):
             if attention_mask is not None:
@@ -19,26 +22,20 @@ class OutputOnlyModel(torch.nn.Module):
             
             for n,module in self.model.base_model.named_children():
                 if n not in ["embeddings", "embed_tokens"]:
-                    module_signature = signature(module.forward)
-                    if "attention_mask" in module_signature.parameters:
+                    if "attention_mask" in self.module_signatures[n].parameters:
                         X = module(X, attention_mask = attention_mask)
-                    elif "attn_mask" in module_signature.parameters:
+                    elif "attn_mask" in self.module_signatures[n].parameters:
                         X = module(X, attn_mask = attention_mask)
+                    elif "mask" in self.module_signatures[n].parameters:
+                        X = module(X, mask = attention_mask)
                     else:
                         X = module(X)
 
             encoder_output = X.last_hidden_state if hasattr(X, "last_hidden_state") else X
 
-            if hasattr(self.model, "classifier"):
-                y = self.model.classifier(
-                    encoder_output[:,pred_id,:] if encoder_output.dim() == 3 else encoder_output
-                )
-            elif hasattr(self.model, "cls"):
-                y = self.model.cls(
-                    encoder_output[:,pred_id,:] if encoder_output.dim() == 3 else encoder_output
-                )
-            else:
-                raise AttributeError("Model has neither classifier nor cls head")
+            encoder_output = encoder_output[:,pred_id,:] if encoder_output.dim() == 3 else encoder_output
+            y = self.lm_head(encoder_output)
+
         else:
             encoder_output, _ = self.model.encoder(X)
             y = self.model.classifier(encoder_output[:, 0])
@@ -86,7 +83,7 @@ def jacobian(nn_input: torch.Tensor, model: torch.nn.Module = None, select: torc
         select = [None]*nn_input.shape[0]
 
     # nn_input.shape = (batch_size, N_patches+1, embedding_size)
-    batch_jacobian, predictions = list(zip(*[
+    batch_jacobian_and_predictions = [
         jacrev(model, argnums = 0, has_aux=True)(
             x,
             pred_id[i],
@@ -94,15 +91,11 @@ def jacobian(nn_input: torch.Tensor, model: torch.nn.Module = None, select: torc
             None if attention_mask is None else attention_mask[i],
             None if given_predictions is None else given_predictions[i]
         )
-    for i,x in enumerate(nn_input.split(1))]))
+    for i,x in enumerate(nn_input.split(1))]
 
     max_len_pred_ids = max(map(len, pred_id))
-    batch_jacobian = torch.stack([
-        torch.cat((J, torch.zeros(J.shape[0], max_len_pred_ids - J.shape[1], *J.shape[2:], device = J.device, dtype = J.dtype)), dim = 1)
-        if J.shape[1] < max_len_pred_ids else 
-        J
-    for J in batch_jacobian])
-    predictions = torch.nn.utils.rnn.pad_sequence([p.T for p in predictions], batch_first = True, padding_value = 0)
+    batch_jacobian = torch.nn.utils.rnn.pad_sequence([J.squeeze(0) for J, _ in batch_jacobian_and_predictions], batch_first = True, padding_value = 0)
+    predictions = torch.nn.utils.rnn.pad_sequence([p.T for _, p in batch_jacobian_and_predictions], batch_first = True, padding_value = 0)
     # batch_jacobian.shape = (batch_size, output_size, (N_patches+1), embedding_size)
 
     batch_jacobian = torch.squeeze(batch_jacobian, dim = list(range(1,batch_jacobian.dim())))
@@ -150,15 +143,19 @@ def pullback(
     if pred_id is None:
         pred_id = [0]*input_simec.shape[0]
 
+    pred_id = [list(set(p)) for p in pred_id]
+
     jac, predictions = jacobian(input_simec, model, select=select, pred_id = pred_id, attention_mask = attention_mask, given_predictions = given_predictions)
     # jac.shape = (batch_size, max_len_pred_ids, selected_vocab_size, input_seq_len, embedding_size)
     # predictions.shape = (batch_size,)
     while jac.dim() < 5:
         jac = torch.unsqueeze(jac, 0)
+
+    max_pred_ids = max(map(len, pred_id))
     
     jac = jac.reshape(
         input_simec.shape[0],
-        max(map(len, pred_id)),
+        max_pred_ids,
         select.shape[-1] if select is not None else 1,
         input_simec.shape[1],
         input_simec.shape[-1]
@@ -171,13 +168,7 @@ def pullback(
     # Select ids and pad if necessary
     max_len = max(map(len, eq_class_emb_ids))
     batch_size = jac.shape[0]
-    jac = torch.stack(
-        [
-            torch.cat((jac[i,:,L,:], torch.zeros(jac.shape[1], max_len - len(L), *jac.shape[3:], device = jac.device, dtype = jac.dtype)), dim = 1)
-            if len(L) < max_len else 
-            jac[i,:,L,:]
-        for i,L in enumerate(eq_class_emb_ids)]
-    )
+    jac = torch.nn.utils.rnn.pad_sequence([T for i,L in enumerate(eq_class_emb_ids) for T in jac[i,:,L,:]], batch_first = True, padding_value = 0).reshape(batch_size, max_pred_ids, max_len, *jac.shape[-2:])
     # jac.shape = (batch_size, max_len_pred_ids, max_eq_class_emb_ids_length, selected_vocab_size, embedding_size)
 
     with torch.no_grad():
@@ -193,20 +184,49 @@ def pullback(
         pullback_metric = torch.bmm(tmp, jac)
         # pullback_metric.shape = (batch_size*max_len*max_len_pred_ids, embedding_size, embedding_size)
 
-        pullback_metric = torch.stack(
-            torch.chunk(pullback_metric, batch_size)
-        )
-        pullback_metric = torch.stack(
-            torch.chunk(pullback_metric, max(map(len, pred_id)), dim = 1),
-            dim = 1
-        )
+        pullback_metric = pullback_metric.reshape(batch_size, max_pred_ids, max_len, *pullback_metric.shape[-2:]).to(dtype = torch.float32)
         # pullback_metric.shape = (batch_size, max_len_pred_ids, max_eq_class_emb_ids_length, embedding_size, embedding_size)
 
-        pullback_metric = pullback_metric.to(dtype = torch.float32)
+        # Strategy 1: Use partial eigendecomposition to estimate rank instead of full matrix_rank
+        # This is faster because we reuse the eigendecomposition work
+        embedding_size = pullback_metric.shape[-1]
+        initial_k = min(min_num_eigenvectors * 2, embedding_size // 2)
+        initial_k = max(initial_k, min_num_eigenvectors)  # Ensure at least min_num_eigenvectors
+        
+        # Do initial eigendecomposition with looser tolerance to estimate rank
+        try:
+            eigenvalues_init, eigenvectors_init = torch.lobpcg(
+                pullback_metric,
+                k=initial_k,
+                method="ortho",
+                tol=EPS * 100,  # Looser tolerance for rank estimation
+                niter=min_num_eigenvectors * 10
+            )
+            
+            # Estimate rank by counting eigenvalues above threshold
+            # Use relative threshold based on maximum eigenvalue magnitude
+            eigenvalue_magnitude = torch.abs(eigenvalues_init)
+            max_eigenval = eigenvalue_magnitude.max(dim=-1, keepdim=True)[0]
+            # Threshold: eigenvalues must be at least 1e-4 of the maximum
+            eigenvalue_threshold = max_eigenval * 1e-4
+            effective_rank = (eigenvalue_magnitude > eigenvalue_threshold).sum(dim=-1)
+            
+            # Determine num_eigenpairs from estimated rank
+            num_eigenpairs = min(
+                max(min_num_eigenvectors, int(effective_rank.median().item())),
+                embedding_size // 3 - 1
+            )
+        except RuntimeError:
+            # Fallback: if initial eigendecomposition fails, use conservative estimate
+            num_eigenpairs = min(
+                max(min_num_eigenvectors, embedding_size // 4),  # Conservative estimate
+                embedding_size // 3 - 1
+            )
 
-        R = torch.linalg.matrix_rank(pullback_metric, hermitian = True)
+        assert num_eigenpairs  <= initial_k, f"num_eigenpairs ({num_eigenpairs}) must be less than or equal to initial_k ({initial_k})"
 
-        eigenvalues, eigenvectors = torch.lobpcg(pullback_metric, k = max(min_num_eigenvectors, int(R.median().item())), method = "ortho", tol = EPS, niter = min_num_eigenvectors*20)
+        # Now compute final eigendecomposition with determined number of eigenpairs
+        eigenvalues, eigenvectors = torch.lobpcg(pullback_metric, k = num_eigenpairs, X = eigenvectors_init, method = "ortho", tol = EPS, niter = min_num_eigenvectors*20)
         # eigenvalues.shape = (batch_size, max_len, R)
         # eigenvectors.shape = (batch_size, max_len, embedding_size, R)
 
