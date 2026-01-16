@@ -1,6 +1,6 @@
 import time
 import functools
-from typing import Callable, Any
+from typing import Callable, Any, Iterable
 
 
 def timing_decorator(func: Callable) -> Callable:
@@ -23,3 +23,17 @@ def timing_decorator(func: Callable) -> Callable:
         return result
     return wrapper
 
+
+def batch_generator(iterable: Iterable, batch_size: int) -> Iterable:
+    """
+    A generator that yields batches of a given size from an iterable.
+    
+    Args:
+        iterable: The iterable to be batched
+        batch_size: The size of the batches
+        
+    Returns:
+        A generator that yields batches of the given size
+    """
+    for i in range(0, len(iterable), batch_size):
+        yield iterable[i:i+batch_size]
