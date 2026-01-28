@@ -133,6 +133,7 @@ def pullback(
     min_num_eigenvectors: int = 8,
     max_num_eigenvectors: int = None,
     approximated_eigendecomposition: bool = False,
+    det_regularization: float = None
 ):
     """
     Computes the pullback metric tensor using the given input and output embeddings and a metric tensor g.
@@ -157,6 +158,9 @@ def pullback(
         pred_id = [0]*input_simec.shape[0]
 
     pred_id = [list(set(p)) for p in pred_id]
+
+    if det_regularization is None:
+        det_regularization = EPS
 
     jac, predictions = jacobian(input_simec, model, select=select, pred_id = pred_id, attention_mask = attention_mask, given_predictions = given_predictions)
     # jac.shape = (batch_size, max_len_pred_ids, selected_vocab_size, input_seq_len, embedding_size)
@@ -252,8 +256,8 @@ def pullback(
 
         # eigenvalues.shape = (batch_size, max_len, max_len, R)
         # eigenvectors.shape = (batch_size, max_len, max_len, embedding_size, R)
-        eigenvalues = eigenvalues[...,::-1]
-        eigenvectors = eigenvectors[...,::-1]
+        eigenvalues = eigenvalues.flip(dims = (-1,))
+        eigenvectors = eigenvectors.flip(dims = (-1,-2))
 
         if return_trace:
             num_eigenvectors = torch.where(eigenvalues > EPS, 1, 0).sum(dim = -1, keepdim = True).to(eigenvalues.device, dtype = torch.int32)
@@ -261,11 +265,12 @@ def pullback(
             # num_eigenvectors.shape = (batch_size, max_len, 1)
             eigenvalues_index = torch.arange(eigenvalues.shape[-1], device = eigenvalues.device, dtype = torch.int32).reshape(1,1,1,-1).repeat(*eigenvalues.shape[:-1], 1)
             eigenvalues = torch.where(eigenvalues_index <= num_eigenvectors, eigenvalues, torch.zeros_like(eigenvalues))
-            trace = torch.sum(eigenvalues, dim = -1)
-            pseudodeterminant = torch.prod(eigenvalues[eigenvalues > EPS], dim = -1)
-            spectral_radius = eigenvalues[..., 0]
+            ub = torch.log(
+                torch.mean(eigenvalues.exp(), dim = -1) + det_regularization*(eigenvalues.std(dim = -1) / eigenvalues.mean(dim = -1))**2
+            )
+            lb = torch.prod(eigenvalues + det_regularization, dim = -1)
 
-            special_trace = 0.5*trace + 0.5*pseudodeterminant/spectral_radius
+            special_trace = 0.5*ub + 0.5*lb
 
             eigenvector_index = torch.arange(eigenvectors.shape[-1], device = eigenvectors.device, dtype = torch.int32).reshape(1,1,1,1,-1).repeat(*eigenvectors.shape[:-1], 1)
             eigenvectors = torch.where(eigenvector_index <= num_eigenvectors.unsqueeze(-1), eigenvectors, torch.zeros_like(eigenvectors))

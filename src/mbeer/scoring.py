@@ -577,10 +577,9 @@ def main():
 
         # Normalize scores to make them intelligible
         current_pos = 0
-        for i,sent_span_combinations in entity_span_combinations:
+        for i,sent_span_combinations in enumerate(entity_span_combinations):
             k = len(sent_span_combinations)
             mi[current_pos:current_pos+k] = (mi[current_pos:current_pos+k] - mi[current_pos:current_pos+k].min()) / (mi[current_pos:current_pos+k].max() - mi[current_pos:current_pos+k].min())
-            current_pos += k
 
             entity_pairs_scores = [
                 {
@@ -595,6 +594,7 @@ def main():
             for j,span_combo in enumerate(sent_span_combinations)]
 
             full_results.extend(entity_pairs_scores)
+            current_pos += k
 
         running_index += batch_size
     
