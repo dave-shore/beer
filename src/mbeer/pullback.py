@@ -2,7 +2,11 @@ import torch
 from typing import List
 from torch.func import jacrev
 from transformers import AutoModel
+from torchkde import KernelDensity
+from cupyx.scipy.sparse.linalg import eigsh
+import math
 from inspect import signature
+import warnings
 
 EPS = 2*torch.finfo(torch.float32).eps
 
@@ -117,6 +121,87 @@ def jacobian(nn_input: torch.Tensor, model: torch.nn.Module = None, select: torc
     return batch_jacobian, predictions
 
 
+def kde_filter_rank_estimate(eigenvalues: torch.Tensor, granularity: float = 1e-4, skip_first_n: int = 5, cutoff: float = 10) -> float:
+
+    kde = KernelDensity(bandwidth=1.0, kernel='gaussian')
+    y = eigenvalues
+    y = y[y < cutoff] if cutoff else y
+    kde.fit(y.reshape(-1,1))
+
+    x = torch.linspace(0, 1, int(granularity**(-1)))[skip_first_n:-skip_first_n]
+    prob = kde.score_samples(x.reshape(-1,1).to(eigenvalues.device, dtype =eigenvalues.dtype)).exp()
+
+    diffs = torch.diff(prob, n = 1, prepend = torch.ones_like(prob[[0]]))
+    second_diffs = torch.diff(prob, n = 2, prepend = torch.ones_like(prob[:2]))
+
+    threshold = x[torch.logical_and(diffs.cpu() > -EPS, second_diffs.cpu() > -EPS)][0].item()
+
+    r = torch.nn.functional.threshold(eigenvalues, threshold, 0).sum(dim = -1)
+
+    if torch.isnan(r).any():
+        warnings.warn("NaN values in r")
+
+    return r
+
+
+def chebyshev_filter_rank_estimate(matrix: torch.Tensor, eigenvalues: torch.Tensor, number_of_sample_vectors: int, degree: int) -> float:
+
+    random_sample_vectors = torch.randn(number_of_sample_vectors, eigenvalues.shape[-1], device = eigenvalues.device, dtype = eigenvalues.dtype)
+    random_sample_vectors = random_sample_vectors / torch.linalg.norm(random_sample_vectors, dim = -1, keepdim = True)    
+
+    dos = torch.cos(eigenvalues)**(-1)
+    dos_diff = dos.diff(dim = -1)
+    a = torch.min(eigenvalues[dos_diff > -EPS], dim = -1)[0]
+    b = torch.max(eigenvalues, dim = -1)[0]
+    gamma_coefficients = [eigenvalues.shape[-1] * (torch.cos(a)**(-1) + torch.cos(b)**(-1)) // math.pi] + [
+        eigenvalues.shape[-1] *(2/math.pi) * (torch.sin(k*torch.cos(a)**(-1)) + torch.sin(k*torch.cos(b)**(-1))) / k
+    for k in range(1, degree+1)]
+
+    quadratic_forms = [
+        torch.sum(
+            (torch.special.chebyshev_polynomial_t(matrix, k) @ random_sample_vectors.T) * random_sample_vectors.T,
+            dim = -2
+        ).mean(dim = -1)
+    for k in range(degree+1)]
+
+    r = torch.sum(torch.stack(quadratic_forms) * torch.stack(gamma_coefficients), dim = 0)
+    
+    if torch.isnan(r).any():
+        warnings.warn("NaN values in r")
+
+    return r
+
+@torch.no_grad()
+def estimate_pdet(eigenvalues: torch.Tensor, det_regularization: float = 1e-3) -> torch.Tensor:
+
+    tr_rad_ratio = eigenvalues.sum(dim = -1) / (eigenvalues[...,0] + EPS)
+    tr_sq_rad_ratio = eigenvalues.pow(2).sum(dim = -1) / (eigenvalues[...,0]**2 + EPS)
+    d = eigenvalues.shape[-1]
+
+    # Mid-point coefficient estimate for the pseudo-determinant
+    normalized_eigenvalues = eigenvalues / eigenvalues[...,[0]]
+    rk_est = d - torch.exp(torch.sum(-normalized_eigenvalues * torch.log(normalized_eigenvalues + EPS), dim = -1))
+    rk_est = torch.clamp(rk_est, min = 1, max = d)
+    
+    lb = torch.sum(torch.log(eigenvalues + det_regularization), dim = -1)
+
+    ub = lb - (d - rk_est) * math.log(det_regularization) + det_regularization*tr_rad_ratio + (1-det_regularization)*tr_sq_rad_ratio / 2
+
+    lb = torch.exp(lb)
+    lb = torch.clamp(lb, min = math.log(EPS)*torch.ones_like(lb), max = torch.maximum(math.log(EPS)*torch.ones_like(lb), eigenvalues[...,0]**rk_est))
+    ub = torch.exp(ub)
+    ub = torch.clamp(ub, min = lb, max = torch.maximum(lb, eigenvalues[...,0]**rk_est))
+
+    special_pdets = torch.where(
+        torch.isfinite(ub), 
+        0.5*ub + 0.5*lb, 
+        lb
+    )
+
+    return special_pdets
+    
+    
+
 def pullback(
     input_simec: torch.Tensor,
     g: torch.Tensor,
@@ -130,10 +215,10 @@ def pullback(
     return_trace: bool = False,
     return_predictions: bool = False,
     given_predictions: torch.Tensor = None,
-    min_num_eigenvectors: int = 8,
+    min_num_eigenvectors: int = 32,
     max_num_eigenvectors: int = None,
     approximated_eigendecomposition: bool = False,
-    det_regularization: float = None
+    det_regularization: float = 1e-3
 ):
     """
     Computes the pullback metric tensor using the given input and output embeddings and a metric tensor g.
@@ -154,13 +239,17 @@ def pullback(
         pullback metric tensor.
     """
 
+    input_simec = input_simec.to(dtype = torch.float64)
+    g = g.to(dtype = torch.float64)
+    if given_predictions is not None:
+        given_predictions = given_predictions.to(dtype = torch.float64)
+    if model is not None:
+        model = model.to(dtype = torch.float64)
+
     if pred_id is None:
         pred_id = [0]*input_simec.shape[0]
 
     pred_id = [list(set(p)) for p in pred_id]
-
-    if det_regularization is None:
-        det_regularization = EPS
 
     jac, predictions = jacobian(input_simec, model, select=select, pred_id = pred_id, attention_mask = attention_mask, given_predictions = given_predictions)
     # jac.shape = (batch_size, max_len_pred_ids, selected_vocab_size, input_seq_len, embedding_size)
@@ -191,6 +280,18 @@ def pullback(
     if max_num_eigenvectors is None:
         max_num_eigenvectors = jac.shape[-1] - 1
 
+    #########################################################
+    jac = torch.stack([torch.cat([chunk, chunk[-1:]], dim=0) for chunk in torch.split(jac, 3, dim = 0)]).transpose(1, 3).flatten(start_dim = 3, end_dim = 4)
+    # J_grouped.shape = (batch_size, max_len_pred_ids, max_eq_class_emb_ids_length, 4*selected_vocab_size, embedding_size)
+    jac_I = torch.cat(torch.chunk(jac, 4, dim = -2)[::2], dim = -2)
+    jac_J = torch.cat(torch.chunk(jac, 4, dim = -2)[1::2], dim = -2)
+    # jac_I.shape = (batch_size, max_len_pred_ids, max_eq_class_emb_ids_length, 4*selected_vocab_size, embedding_size)
+    # jac_J.shape = (batch_size, max_len_pred_ids, max_eq_class_emb_ids_length, 4*selected_vocab_size, embedding_size)
+
+    jac = torch.stack([jac_I, jac_J], dim = 1).flatten(end_dim = 1)
+    # jac.shape = (batch_size*2, max_len_pred_ids, max_eq_class_emb_ids_length, 2*selected_vocab_size, embedding_size)
+    g = g.repeat_interleave(2, dim = -1).repeat_interleave(2, dim = -2)
+
     with torch.no_grad():
         jac = torch.transpose(jac, 1, 2)
         jac = torch.flatten(jac, end_dim = -3)
@@ -199,60 +300,26 @@ def pullback(
         # jac_t.shape = (batch_size*max_len, max_len_pred_ids, embedding_size, selected_vocab_size)
 
         # g.shape = (batch_size, max_len, selected_vocab_size, selected_vocab_size)
-        tmp = torch.bmm(jac_t, torch.flatten(g, end_dim=1)) if g.dim() == 4 else torch.bmm(jac_t, g)
+        g_flat = torch.flatten(g, end_dim = 1) if g.dim() == 4 else g
+        g_flat = g_flat[:jac_t.shape[0]] if g.shape[0] > jac_t.shape[0] else g_flat.tile(jac_t.shape[0] // g.shape[0] + 1, 1, 1)[:jac_t.shape[0]]
+        tmp = torch.bmm(jac_t, g_flat)
         # tmp.shape = (batch_size*max_len*max_len_pred_ids, embedding_size, selected_vocab_size)
         pullback_metric = torch.bmm(tmp, jac)
         # pullback_metric.shape = (batch_size*max_len*max_len_pred_ids, embedding_size, embedding_size)
 
-        pullback_metric = pullback_metric.reshape(batch_size, max_pred_ids, max_len, *pullback_metric.shape[-2:]).to(dtype = torch.float32)
+        pullback_metric = pullback_metric.reshape(batch_size // 3 * 2, max_pred_ids, max_len, *pullback_metric.shape[-2:])
         # pullback_metric.shape = (batch_size, max_len_pred_ids, max_eq_class_emb_ids_length, embedding_size, embedding_size)
 
-        # Strategy 1: Use partial eigendecomposition to estimate rank instead of full matrix_rank
-        # This is faster because we reuse the eigendecomposition work
         embedding_size = pullback_metric.shape[-1]
         initial_k = min(min_num_eigenvectors * 2, embedding_size // 2)
         initial_k = max(initial_k, min_num_eigenvectors)  # Ensure at least min_num_eigenvectors
 
         if approximated_eigendecomposition:
-            # Do initial eigendecomposition with looser tolerance to estimate rank
-            try:
-                eigenvalues_init, eigenvectors_init = torch.lobpcg(
-                    pullback_metric,
-                    k=initial_k,
-                    method="ortho",
-                    tol=EPS * 100,  # Looser tolerance for rank estimation
-                    niter=min_num_eigenvectors * 10
-                )
-                
-                # Estimate rank by counting eigenvalues above threshold
-                # Use relative threshold based on maximum eigenvalue magnitude
-                eigenvalue_magnitude = torch.abs(eigenvalues_init)
-                max_eigenval = eigenvalue_magnitude.max(dim=-1, keepdim=True)[0]
-                # Threshold: eigenvalues must be at least 1e-4 of the maximum
-                eigenvalue_threshold = max_eigenval * 1e-4
-                effective_rank = (eigenvalue_magnitude > eigenvalue_threshold).sum(dim=-1)
-                
-                # Determine num_eigenpairs from estimated rank
-                num_eigenpairs = min(
-                    max(min_num_eigenvectors, int(effective_rank.median().item())),
-                    embedding_size // 3 - 1
-                )
-            except RuntimeError:
-                # Fallback: if initial eigendecomposition fails, use conservative estimate
-                num_eigenpairs = min(
-                    max(min_num_eigenvectors, embedding_size // 4),  # Conservative estimate
-                    embedding_size // 3 - 1
-                )
-                eigenvectors_init = torch.zeros_like(pullback_metric)[...,:num_eigenpairs]
-
-            assert num_eigenpairs  <= initial_k, f"num_eigenpairs ({num_eigenpairs}) must be less than or equal to initial_k ({initial_k})"
-
             # Now compute final eigendecomposition with determined number of eigenpairs
-            eigenvalues, eigenvectors = torch.lobpcg(pullback_metric, k = num_eigenpairs, X = eigenvectors_init, method = "ortho", tol = EPS, niter = min_num_eigenvectors*20)
+            eigenvalues, eigenvectors = eigsh(pullback_metric, k = initial_k, which = "LM", tol = EPS, maxiter = min_num_eigenvectors*20, return_eigenvectors = True)
+
         else:
             eigenvalues, eigenvectors = torch.linalg.eigh(pullback_metric)
-            eigenvalues = eigenvalues
-            eigenvectors = eigenvectors
 
         # eigenvalues.shape = (batch_size, max_len, max_len, R)
         # eigenvectors.shape = (batch_size, max_len, max_len, embedding_size, R)
@@ -265,18 +332,16 @@ def pullback(
             # num_eigenvectors.shape = (batch_size, max_len, 1)
             eigenvalues_index = torch.arange(eigenvalues.shape[-1], device = eigenvalues.device, dtype = torch.int32).reshape(1,1,1,-1).repeat(*eigenvalues.shape[:-1], 1)
             eigenvalues = torch.where(eigenvalues_index <= num_eigenvectors, eigenvalues, torch.zeros_like(eigenvalues))
-            ub = torch.log(
-                torch.mean(eigenvalues.exp(), dim = -1) + det_regularization*(eigenvalues.std(dim = -1) / eigenvalues.mean(dim = -1))**2
-            )
-            lb = torch.prod(eigenvalues + det_regularization, dim = -1)
 
-            special_trace = 0.5*ub + 0.5*lb
+            traces = eigenvalues.sum(dim = -1)
+            radii = eigenvalues[...,0]
+            special_pdets = estimate_pdet(eigenvalues, det_regularization = det_regularization)
 
             eigenvector_index = torch.arange(eigenvectors.shape[-1], device = eigenvectors.device, dtype = torch.int32).reshape(1,1,1,1,-1).repeat(*eigenvectors.shape[:-1], 1)
             eigenvectors = torch.where(eigenvector_index <= num_eigenvectors.unsqueeze(-1), eigenvectors, torch.zeros_like(eigenvectors))
             eigenvectors = eigenvectors[...,:num_eigenvectors.max().item()]
 
-            return special_trace, eigenvectors, (predictions if return_predictions else None)
+            return special_pdets, traces, radii, eigenvectors, (predictions if return_predictions else None)
 
         if degrowth and same_equivalence_class:
             jac_eigen_dot_prod = torch.bmm(jac, torch.flatten(eigenvectors, end_dim=1))

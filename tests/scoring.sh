@@ -1,9 +1,9 @@
 #!/bin/bash -l
 #SBATCH --job-name=david-scoring
-#SBATCH --partition=gpu_short
-#SBATCH --time=2:00:00
+#SBATCH --partition=gpu_long
+#SBATCH --time=12:00:00
 #SBATCH --cpus-per-task=4
-#SBATCH --gres=gpu:a100-80:1
+#SBATCH --gres=gpu:a100-80:2
 
 ENV_NAME="beer"
 PYTHON_VERSION="3.12"
