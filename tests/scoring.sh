@@ -1,9 +1,9 @@
 #!/bin/bash -l
 #SBATCH --job-name=david-scoring
 #SBATCH --partition=gpu_long
-#SBATCH --time=12:00:00
-#SBATCH --cpus-per-task=4
-#SBATCH --gres=gpu:a100-80:2
+#SBATCH --time=18:00:00
+#SBATCH --cpus-per-task=8
+#SBATCH --gres=gpu:p6000:1
 
 ENV_NAME="beer"
 PYTHON_VERSION="3.12"
@@ -54,4 +54,8 @@ fi
 
 # Run the training script
 cd ../src/mbeer
-python3 scoring.py >& scoring.out.log
+models=("tanaos/tanaos-NER-v1" "dslim/bert-base-NER" "Babelscape/wikineural-multilingual-ner" "numind/NuNER-v2.0" "Mozilla/distilbert-uncased-NER-LoRA" "rv2307/electra-small-ner")
+for model in "${models[@]}"; do
+    model_name=$(echo $model | tr '/' '-')
+    python3 scoring.py --mbrd --model-name $model >& scoring-${model_name}.out.log
+done

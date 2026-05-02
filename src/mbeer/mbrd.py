@@ -452,7 +452,7 @@ class BatchMatrixFactorizationALS(MatrixFactorizationALS):
 
 
 class BatchProbabilisticMBR(DecoderProbabilisticMBR):
-    """Batch version of the probabilistic MBR algorithm, with one list of hypotheses, N sources, and N lists of references."""
+    """Batch version of the probabilistic MBR algorithm, with one list of H hypotheses, N sources, and N lists of references, where N is the number of entity pairs."""
 
     def triwise_scores_probabilistic(
         self,
@@ -541,6 +541,7 @@ class BatchProbabilisticMBR(DecoderProbabilisticMBR):
             seed=self.cfg.seed,
         )
         reconstructed_triwise_scores = X @ Y.T
+        # reconstruct
 
         return reconstructed_triwise_scores
 
@@ -549,7 +550,7 @@ class BatchProbabilisticMBR(DecoderProbabilisticMBR):
         hypotheses: list[str],
         references: list[List[torch.Tensor | str]],
         sources: list[str],
-        nbest: int = 1,
+        nbest: int = 5,
         reference_lprobs: Optional[torch.Tensor] = None,
         batch_size: int = 16,
     ) -> DecoderMBR.Output:
@@ -595,7 +596,7 @@ class BatchProbabilisticMBR(DecoderProbabilisticMBR):
 
 class RelationDisambiguation():
 
-    def __init__(self, model_name: str, hypotheses: List[str], topk: int = 1, batch_size: int = 16):
+    def __init__(self, model_name: str, hypotheses: List[str], topk: int = 5, batch_size: int = 16):
 
         self.model_name = model_name
         self.topk = topk
@@ -611,12 +612,15 @@ class RelationDisambiguation():
         self.hypotheses = hypotheses
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    def __call__(self, input_embeddings: List[torch.Tensor], sources: List[str]) -> torch.Tensor:
+    def __call__(self, input_embeddings: List[List[torch.Tensor]], sources: List[str], show_progress_bar: bool = True) -> torch.Tensor:
 
-        references = list(cartesian(*[torch.chunk(emb, chunks = input_embeddings.shape[-2], dim = -2) for emb in input_embeddings]))
+        assert len(input_embeddings) == len(sources)
+
+        references = [[(L[i], L[j]) for i in range(len(L)) for j in range(len(L)) if i != j] for L in input_embeddings]
     
-        pseudorefs = tqdm(references)
+        pseudorefs = tqdm(references, desc = "Generating pseudoreferences", disable = not show_progress_bar)
         candidates = [self.tokenizer.special_tokens_map['mask_token'] + " " + p + " " + self.tokenizer.special_tokens_map['mask_token'] for p in self.hypotheses]
 
         output = self.decoder.batch_decode(candidates, pseudorefs, sources, nbest=self.topk, batch_size=self.topkbatch_size)
+
         return output

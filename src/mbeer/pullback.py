@@ -15,6 +15,7 @@ class OutputOnlyModel(torch.nn.Module):
     def __init__(self, model: AutoModel, encoder_name: str = "encoder"):
         super().__init__()
         self.model = model
+        self.encoder_name = encoder_name
         self.device = model.device if hasattr(model, "device") else next(model.parameters()).device
         self.dtype = model.dtype if hasattr(model, "dtype") else next(model.parameters()).dtype
         self.encoder = model.base_model.get_submodule(encoder_name)
@@ -37,11 +38,11 @@ class OutputOnlyModel(torch.nn.Module):
                 else:
                     attention_mask = attention_mask[:batch_size].reshape(batch_size, seq_len)
             
-            if "attention_mask" in self.module_signatures["encoder"].parameters:
+            if "attention_mask" in self.module_signatures[self.encoder_name].parameters:
                 X = self.encoder(X, attention_mask = attention_mask)
-            elif "attn_mask" in self.module_signatures["encoder"].parameters:
+            elif "attn_mask" in self.module_signatures[self.encoder_name].parameters and "distil" not in self.model.config._name_or_path:
                 X = self.encoder(X, attn_mask = attention_mask)
-            elif "mask" in self.module_signatures["encoder"].parameters:
+            elif "mask" in self.module_signatures[self.encoder_name].parameters:
                 X = self.encoder(X, mask = attention_mask)
             else:
                 X = self.encoder(X)
@@ -175,26 +176,28 @@ def chebyshev_filter_rank_estimate(matrix: torch.Tensor, eigenvalues: torch.Tens
 def estimate_pdet(eigenvalues: torch.Tensor, det_regularization: float = 1e-3) -> torch.Tensor:
 
     tr_rad_ratio = eigenvalues.sum(dim = -1) / (eigenvalues[...,0] + EPS)
-    tr_sq_rad_ratio = eigenvalues.pow(2).sum(dim = -1) / (eigenvalues[...,0]**2 + EPS)
+    tr_sq_rad_ratio = eigenvalues.pow(2).sum(dim = -1) / (eigenvalues.pow(2)[...,0] + EPS)
     d = eigenvalues.shape[-1]
 
     # Mid-point coefficient estimate for the pseudo-determinant
-    normalized_eigenvalues = eigenvalues / eigenvalues[...,[0]]
-    rk_est = d - torch.exp(torch.sum(-normalized_eigenvalues * torch.log(normalized_eigenvalues + EPS), dim = -1))
+    normalized_eigenvalues = eigenvalues / (eigenvalues[...,[0]] + EPS)
+    rk_est = torch.sum(normalized_eigenvalues, dim = -1)
     rk_est = torch.clamp(rk_est, min = 1, max = d)
     
-    lb = torch.sum(torch.log(eigenvalues + det_regularization), dim = -1)
+    log_lb = torch.sum(torch.log(eigenvalues + det_regularization), dim = -1) - (d - rk_est) * math.log(det_regularization) 
 
-    ub = lb - (d - rk_est) * math.log(det_regularization) + det_regularization*tr_rad_ratio + (1-det_regularization)*tr_sq_rad_ratio / 2
+    log_ub = log_lb + det_regularization*tr_rad_ratio + (1-det_regularization)*tr_sq_rad_ratio / 2
 
-    lb = torch.exp(lb)
-    lb = torch.clamp(lb, min = math.log(EPS)*torch.ones_like(lb), max = torch.maximum(math.log(EPS)*torch.ones_like(lb), eigenvalues[...,0]**rk_est))
-    ub = torch.exp(ub)
-    ub = torch.clamp(ub, min = lb, max = torch.maximum(lb, eigenvalues[...,0]**rk_est))
+    general_ub = (eigenvalues.sum(dim = -1) / rk_est)**rk_est
+
+    lb = torch.exp(log_lb)
+    lb = torch.clamp(lb, min = EPS*torch.ones_like(lb), max = torch.maximum(EPS*torch.ones_like(lb), general_ub))
+    ub = torch.exp(log_ub)
+    ub = torch.clamp(ub, min = lb, max = torch.maximum(lb, general_ub))
 
     special_pdets = torch.where(
         torch.isfinite(ub), 
-        0.5*ub + 0.5*lb, 
+        (ub + lb) / 2, 
         lb
     )
 
@@ -274,11 +277,16 @@ def pullback(
     # Select ids and pad if necessary
     max_len = max(map(len, eq_class_emb_ids))
     batch_size = jac.shape[0]
+    max_idx = max(max(L) for L in eq_class_emb_ids)
+    assert max_idx < jac.shape[2], f"eq_class_emb_ids index {max_idx} >= jac dim 2 ({jac.shape[2]})"
+
     jac = torch.nn.utils.rnn.pad_sequence([T for i,L in enumerate(eq_class_emb_ids) for T in jac[i,:,L,:]], batch_first = True, padding_value = 0).reshape(batch_size, max_pred_ids, max_len, *jac.shape[-2:])
     # jac.shape = (batch_size, max_len_pred_ids, max_eq_class_emb_ids_length, selected_vocab_size, embedding_size)
 
     if max_num_eigenvectors is None:
         max_num_eigenvectors = jac.shape[-1] - 1
+
+    assert input_simec.shape[0] % 3 == 0, f"Batch size {input_simec.shape[0]} must be divisible by 3"
 
     #########################################################
     jac = torch.stack([torch.cat([chunk, chunk[-1:]], dim=0) for chunk in torch.split(jac, 3, dim = 0)]).transpose(1, 3).flatten(start_dim = 3, end_dim = 4)
@@ -296,27 +304,42 @@ def pullback(
         jac = torch.transpose(jac, 1, 2)
         jac = torch.flatten(jac, end_dim = -3)
         # jac.shape = (batch_size*max_len*max_len_pred_ids, selected_vocab_size, embedding_size)
-        jac_t = torch.transpose(jac, -2, -1)
-        # jac_t.shape = (batch_size*max_len, max_len_pred_ids, embedding_size, selected_vocab_size)
 
         # g.shape = (batch_size, max_len, selected_vocab_size, selected_vocab_size)
         g_flat = torch.flatten(g, end_dim = 1) if g.dim() == 4 else g
-        g_flat = g_flat[:jac_t.shape[0]] if g.shape[0] > jac_t.shape[0] else g_flat.tile(jac_t.shape[0] // g.shape[0] + 1, 1, 1)[:jac_t.shape[0]]
+        g_flat = g_flat[:jac.shape[0]] if g.shape[0] > jac.shape[0] else g_flat.tile(jac.shape[0] // g.shape[0] + 1, 1, 1)[:jac.shape[0]]
+        if jac.shape[-2] < g_flat.shape[-1]:
+            jac = torch.nn.functional.pad(jac, (0,0,0,g_flat.shape[-1]-jac.shape[-2]))
+        elif jac.shape[-1] > g_flat.shape[-1]:
+            g_flat = torch.nn.functional.pad(g_flat, (0,jac.shape[-2]-g_flat.shape[-1],0,0))
+        
+        if jac.shape[0] < g_flat.shape[0]:
+            jac = torch.cat([jac, torch.zeros(g_flat.shape[0]-jac.shape[0], *jac.shape[1:], device = jac.device, dtype = jac.dtype)])
+
+        jac_t = torch.transpose(jac, -2, -1)
+        # jac_t.shape = (batch_size*max_len, max_len_pred_ids, embedding_size, selected_vocab_size)
+
         tmp = torch.bmm(jac_t, g_flat)
         # tmp.shape = (batch_size*max_len*max_len_pred_ids, embedding_size, selected_vocab_size)
         pullback_metric = torch.bmm(tmp, jac)
         # pullback_metric.shape = (batch_size*max_len*max_len_pred_ids, embedding_size, embedding_size)
 
-        pullback_metric = pullback_metric.reshape(batch_size // 3 * 2, max_pred_ids, max_len, *pullback_metric.shape[-2:])
+        output_batch_size = batch_size // 3 * 2
+        output_batch_size = max(1, output_batch_size)
+
+        try:
+            pullback_metric = pullback_metric.reshape(output_batch_size, max_pred_ids, max_len, *pullback_metric.shape[-2:])
+        except RuntimeError:
+            pullback_metric = pullback_metric.reshape(2*output_batch_size, max_pred_ids, max_len, *pullback_metric.shape[-2:])[::2]
         # pullback_metric.shape = (batch_size, max_len_pred_ids, max_eq_class_emb_ids_length, embedding_size, embedding_size)
 
         embedding_size = pullback_metric.shape[-1]
-        initial_k = min(min_num_eigenvectors * 2, embedding_size // 2)
+        initial_k = min([embedding_size // 2, g.shape[-1]])
         initial_k = max(initial_k, min_num_eigenvectors)  # Ensure at least min_num_eigenvectors
 
         if approximated_eigendecomposition:
             # Now compute final eigendecomposition with determined number of eigenpairs
-            eigenvalues, eigenvectors = eigsh(pullback_metric, k = initial_k, which = "LM", tol = EPS, maxiter = min_num_eigenvectors*20, return_eigenvectors = True)
+            eigenvalues, eigenvectors = eigsh(pullback_metric, k = initial_k, which = "LM", tol = EPS, maxiter = initial_k*100, return_eigenvectors = True)
 
         else:
             eigenvalues, eigenvectors = torch.linalg.eigh(pullback_metric)
