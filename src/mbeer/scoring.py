@@ -73,9 +73,19 @@ except ImportError:
 
 def _resolve_torch_device(d) -> torch.device:
     """Canonical CUDA device for dict keys and set_device (cuda -> cuda:0)."""
-    x = torch.device(d)
-    if x.type == "cuda" and x.index is None:
-        return torch.device("cuda", 0)
+    
+    x = torch.device(d) if d is not None else "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    
+    if isinstance(x, str):
+        x = torch.device(x, 0)
+    elif isinstance(x, torch.device):
+        if x.type == "cuda" and x.index is None:
+            x = torch.device("cuda", 0)
+        else:
+            pass
+    else:
+        raise ValueError(f"Invalid device type: {type(x)}")
+
     return x
 
 
@@ -127,13 +137,16 @@ def pad_traces_and_eigenvectors(L: List[torch.Tensor]) -> torch.Tensor:
     return output
     
 
-def train_lm_head(model_name: str, device: torch.device, mask_id: int, n_epochs: int = 10, inputs: torch.Tensor = None, attn_mask: torch.Tensor = None, encoder_name: str = "encoder"):
+def train_lm_head(model_name: str, device: torch.device, mask_id: int, n_epochs: int = 10, inputs: torch.Tensor = None, attn_mask: torch.Tensor = None, encoder_name: str = "encoder", patience: int = None, tol: float = 1e-6):
 
     parent_model_info = hf_api.model_info(model_name)
     parent_model_name = parent_model_info.card_data.get("base_model", None)
     if isinstance(parent_model_name, list):
         parent_model_name = parent_model_name[0]
     ignore_modules = ["dropout", "activation", "act_fn"]
+
+    if patience is None:
+        patience = n_epochs // 10
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     masked_inputs = torch.where(torch.rand_like(inputs.to(dtype = torch.float32)) < 0.15, mask_id, inputs)
@@ -181,11 +194,17 @@ def train_lm_head(model_name: str, device: torch.device, mask_id: int, n_epochs:
                 def closure(logits, targets):
                     optimizer.zero_grad()
                     vocab_size = logits.shape[-1]
-                    loss = loss_fn(logits.view(-1, vocab_size), targets.view(-1, 1))
+                    loss = loss_fn(
+                        logits.view(-1, vocab_size), 
+                        torch.nn.functional.one_hot(targets.view(-1), vocab_size).to(logits.device, dtype = logits.dtype)
+                    )
                     loss.backward()
                     return loss
 
+                loss_sequence = torch.ones(patience, device = device) * float("inf")
+
                 for epoch in trange(n_epochs, desc = "Training LM head"):
+                    epoch_loss = []
                     for minibatch in dataloader:
                         selected_inputs, selected_targets, selected_attn_mask = minibatch
                         selected_inputs = selected_inputs.to(device)
@@ -195,7 +214,13 @@ def train_lm_head(model_name: str, device: torch.device, mask_id: int, n_epochs:
                         masked_tokens_mask = torch.repeat_interleave(selected_inputs.reshape(selected_inputs.shape[0], -1, 1) == mask_token_id, y.shape[-1], dim = -1)
                         masked_logits = y[masked_tokens_mask].reshape(-1, y.shape[-1])
                         masked_targets = selected_targets[masked_tokens_mask[...,0]].reshape(-1)
-                        optimizer.step(lambda: closure(masked_logits, masked_targets))
+                        current_loss = optimizer.step(lambda: closure(masked_logits, masked_targets))
+                        epoch_loss.append(current_loss.item())
+                    epoch_loss = torch.as_tensor(epoch_loss).mean().item()
+                    loss_sequence[epoch % patience] = epoch_loss
+                    if torch.all(loss_sequence <= max(epoch_loss, tol)):
+                        break
+                    print(f"Epoch {epoch}, loss: {epoch_loss:.4f}")
 
             optimizer.zero_grad(set_to_none = True)
             del optimizer, loss_fn
@@ -696,11 +721,14 @@ def get_combination_indices_with_repeats(lists, num_indices_per_doc=None):
 
 
 @timing_decorator
-def main(test: bool = False, model_name: str = None, with_mbrd: bool = False):
+def main(test: bool = False, model_name: str = None, with_mbrd: bool = False, devices: List[str] = None):
     
     print(f"Scoring model: {model_name}")
-    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-    train_device = _resolve_torch_device(device)
+    if devices is not None:
+        train_device = torch.device(devices[0])
+    else:
+        train_device = _resolve_torch_device(None)
+        
     training_data = load_dataset("xiaobendanyn/tacred", split = "train")
     data = load_dataset("xiaobendanyn/tacred", split = "test")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -758,10 +786,10 @@ def main(test: bool = False, model_name: str = None, with_mbrd: bool = False):
         encoder_name = encoder_name
     )
 
-    if torch.cuda.device_count() > 1:
+    if devices is not None and len(devices) > 1:
         mlm_by_device = {}
         ner_by_device = {}
-        for i in range(torch.cuda.device_count()):
+        for i, device in enumerate(devices):
             d = torch.device("cuda", i)
             if d == train_device:
                 mlm_by_device[d] = mlm_model
@@ -902,8 +930,8 @@ def main(test: bool = False, model_name: str = None, with_mbrd: bool = False):
         return list(chain(*[score_batch(batch, running_index = running_index + i * batch_size, work_device = work_device, mlm_for_pass = mlm_for_pass, ner_for_pass = ner_for_pass, gold_spans = gold_spans[i*batch_size:(i+1)*batch_size]) for i, batch in enumerate(batch_list)]))
 
     
-    if torch.cuda.device_count() > 1:
-        devices = [torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())]
+    if devices is not None and len(devices) > 1:
+        devices = [torch.device(device) for device in devices]
         batches = list(batch_generator(ex, batch_size))
         list_size = (len(batches) + len(devices) - 1) // len(devices)
         batch_lists = [batches[i:i+list_size] for i in range(0, len(batches), list_size)]
@@ -985,5 +1013,8 @@ if __name__ == "__main__":
     parser.add_argument("--test", action="store_true", default=False)
     parser.add_argument("--model-name", type=str, default="tanaos/tanaos-NER-v1")
     parser.add_argument("--mbrd", action="store_true", default=False)
+    parser.add_argument("--device", type=str, default=None)
     args = parser.parse_args()
-    main(test=args.test, model_name=args.model_name, with_mbrd=args.mbrd)
+
+    devices = args.device.split("-") if args.device is not None else None
+    main(test=args.test, model_name=args.model_name, with_mbrd=args.mbrd, devices=devices)
