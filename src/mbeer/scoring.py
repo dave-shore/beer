@@ -1,53 +1,46 @@
-from typing import List, Tuple
-import torch
-from torch.utils.data import DataLoader, TensorDataset
-from itertools import combinations, chain
-from difflib import SequenceMatcher
-import pandas as pd
-import json
-from math import sqrt
-import itertools
-from scipy.stats import chi2
+"""Main script"""
+
+import argparse
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from copy import deepcopy
+from difflib import SequenceMatcher
+import gc
+import itertools
+from itertools import chain, combinations
+import json
+import math
+import os
+import re
+from typing import List, Tuple
+import warnings
+
 from datasets import load_dataset
 from huggingface_hub import HfApi
-from transformers import AutoModelForTokenClassification, AutoTokenizer, AutoModelForMaskedLM
+import pandas as pd
+from scipy.stats import chi2
+import torch
+from torch.nn import functional as F
+from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm, trange
-from copy import deepcopy
-import re
-import gc
-import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import warnings
-import argparse
-from mbeer.mbrd import *
+from transformers import (
+    AutoModelForMaskedLM,
+    AutoModelForTokenClassification,
+    AutoTokenizer,
+)
+
+from mbeer.baseline_functions import (
+    mean_integrated_directional_gradients,
+    shapley_interaction_quantification,
+)
+from mbeer.mbrd import RelationDisambiguation
 
 hf_api = HfApi()
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 EPS = 2*torch.finfo(torch.float32).eps
+torch.set_default_dtype(torch.float32)
 _WORD_RE = re.compile(r"\w+")
-
-
-def _sample_span_positions(span: Tuple[int, int], max_tokens: int) -> torch.Tensor:
-    """Token-position indices to sample within `span`.
-
-    Returns the full range when `width < max_tokens`; otherwise returns
-    `max_tokens // 2` positions interleaved from each end (start, end-1,
-    start+1, end-2, ...). Output shape is (k, 1), int64, matching the
-    original ``arange(a, b)[idxs].reshape(-1, 1)`` contract.
-    """
-    a, b = span
-    width = b - a
-    if width < max_tokens:
-        return torch.arange(a, b, dtype=torch.long).reshape(-1, 1)
-    half = max_tokens // 2
-    indices: List[int] = []
-    for i in range(half):
-        indices.append(a + i)
-        indices.append(b - 1 - i)
-    return torch.tensor(indices, dtype=torch.long).reshape(-1, 1)
-
 
 def _mask_spans(encoding: torch.Tensor, spans: List[Tuple[int, int]], mask_id: int) -> torch.Tensor:
     """Clone `encoding` and overwrite all positions in any of `spans` with `mask_id`."""
@@ -58,8 +51,9 @@ def _mask_spans(encoding: torch.Tensor, spans: List[Tuple[int, int]], mask_id: i
 
 # Handle both relative and absolute imports
 try:
-    from .pullback import OutputOnlyModel, pullback
-    from .utils import timing_decorator, batch_generator
+    from .pullback import (OutputOnlyModel,
+                           compute_pred_ids_and_eq_class_emb_ids, pullback)
+    from .utils import batch_generator, timing_decorator
 except ImportError:
     # If relative import fails, try absolute import
     import sys
@@ -67,8 +61,8 @@ except ImportError:
     src_path = Path(__file__).parent.parent.parent / "src"
     if str(src_path) not in sys.path:
         sys.path.insert(0, str(src_path))
-    from mbeer.pullback import OutputOnlyModel, pullback
-    from mbeer.utils import timing_decorator, batch_generator
+    from mbeer.pullback import OutputOnlyModel, compute_pred_ids_and_eq_class_emb_ids, pullback
+    from mbeer.utils import batch_generator, timing_decorator
 
 
 def _resolve_torch_device(d) -> torch.device:
@@ -79,7 +73,7 @@ def _resolve_torch_device(d) -> torch.device:
     if isinstance(x, str):
         x = torch.device(x, 0)
     elif isinstance(x, torch.device):
-        if x.type == "cuda" and x.index is None:
+        if getattr(x, "type", None) == "cuda" and x.index is None:
             x = torch.device("cuda", 0)
         else:
             pass
@@ -106,7 +100,7 @@ def pad_traces_and_eigenvectors(L: List[torch.Tensor]) -> torch.Tensor:
         try:
             force_shape = next(s for s in shapes if len(s) == dim)
             L = [T.reshape(fill_shape(T.shape, force_shape)) for T in L]
-        except:
+        except RuntimeError:
             raise ValueError("All tensors must have the same number of dimensions or be reshapeable to the same number of dimensions")
 
     if dim < 3:
@@ -196,7 +190,7 @@ def train_lm_head(model_name: str, device: torch.device, mask_id: int, n_epochs:
                     vocab_size = logits.shape[-1]
                     loss = loss_fn(
                         logits.view(-1, vocab_size), 
-                        torch.nn.functional.one_hot(targets.view(-1), vocab_size).to(logits.device, dtype = logits.dtype)
+                        F.one_hot(targets.view(-1), vocab_size).to(logits.device, dtype = logits.dtype)
                     )
                     loss.backward()
                     return loss
@@ -249,7 +243,7 @@ def forward_backward_pass(batch: List[str], model: AutoModelForTokenClassificati
     row_lens = attn_mask.sum(dim = 1)
     num_labels = len(pred_to_mask) if pred_to_mask else 2
     # Threshold from power of Chi-Squared test for uniformity of distribution
-    probit_threshold = 1 / num_labels + sqrt(chi2.sf(0.95, num_labels - 1) / (2*num_labels))
+    probit_threshold = 1 / num_labels + math.sqrt(chi2.sf(0.95, num_labels - 1) / (2*num_labels))
     probit_threshold = min(probit_threshold, 0.5)
 
     logit_threshold = torch.nn.Sequential(torch.nn.Softmax(dim = -1), torch.nn.Threshold(probit_threshold, 0))
@@ -375,39 +369,7 @@ def forward_backward_pass(batch: List[str], model: AutoModelForTokenClassificati
     # Cache sampled positions per unique entity span so identical spans
     # (the common case across pair combinations within a document) share
     # the same tensor instead of rebuilding it.
-    span_sample_cache: dict = {}
-    def _cached_sample(span: Tuple[int, int]) -> torch.Tensor:
-        s = span_sample_cache.get(span)
-        if s is None:
-            s = _sample_span_positions(span, max_tokens_per_entity)
-            span_sample_cache[span] = s
-        return s
-
-    eq_class_emb_ids = list(chain(*[
-        [
-            torch.cat([_cached_sample(ent) for ent in ent_span_list if ent != current_ent])
-        for current_ent in ent_span_list] +
-        [
-            torch.cat([_cached_sample(s), _cached_sample(o)])
-        for s,o in span_combo_list]
-        if len(ent_span_list) > 1 else
-        [
-            torch.zeros(1, dtype = torch.int32), -torch.ones(1, dtype = torch.int32)
-        ]
-    for span_combo_list, ent_span_list in zip(span_combinations, ent_spans)]))
-    eq_class_emb_ids = torch.nn.utils.rnn.pad_sequence(eq_class_emb_ids, batch_first = True, padding_value = -1).squeeze(-1)
-    # eq_class_emb_ids.shape = (batch_size*(N_entities + N_pairs), max_perturbed_entity_spans_length)
-
-    pred_ids = list(chain(*[
-        [
-            _cached_sample(ent)
-        for ent in ent_span_list] +
-        [
-            torch.cat([_cached_sample(s), _cached_sample(o)])
-        for s,o in span_combo_list]
-    for span_combo_list, ent_span_list in zip(span_combinations, ent_spans)]))
-    pred_ids = torch.nn.utils.rnn.pad_sequence(pred_ids, batch_first = True, padding_value = -1).squeeze(-1)
-    # pred_ids.shape = (batch_size*3*N_combinations(len(spans), 2), max_perturbed_entity_spans_length)
+    pred_ids, eq_class_emb_ids = compute_pred_ids_and_eq_class_emb_ids(span_combinations, ent_spans, max_tokens_per_entity)
 
     separators = list(chain(*[
         [
@@ -538,7 +500,7 @@ def forward_backward_pass(batch: List[str], model: AutoModelForTokenClassificati
     return final_outputs, span_combinations, ent_spans, valid_documents
 
 
-def arnold_gokhale_denominator(P_i_cond_j: torch.Tensor, P_j_cond_i: torch.Tensor, vocab_size: int = None, tol: float = 1e-3, max_iter: int = 1000):
+def arnold_gokhale_denominator(P_i_cond_j: torch.Tensor, P_j_cond_i: torch.Tensor, vocab_size: int = None, tol: float = 1e-2, max_iter: int = 100):
     """From 'Distributions most nearly compatible with given families of conditional distributions' by Arnold and Gokhale (1998)"""
 
     if vocab_size is None:
@@ -648,10 +610,10 @@ def compute_mutual_information(traces: torch.Tensor, pdets: torch.Tensor, radii:
     # cond_probas.shape = (len(batch)*N_combinations(len(spans), 2), max_len_entities, selected_vocab_size)
     vocab_Pi = cond_probas * mask_Pi
     vocab_Pj = cond_probas * mask_Pj
-    num_Pi = cond_predictions * mask_Pi.squeeze(-1)
-    num_Pj = cond_predictions * mask_Pj.squeeze(-1)
-    den_Pi = mask_predictions * mask_Pi.squeeze(-1)
-    den_Pj = mask_predictions * mask_Pj.squeeze(-1)
+    num_Pi = cond_predictions.unsqueeze(-1) * mask_Pi
+    num_Pj = cond_predictions.unsqueeze(-1) * mask_Pj
+    den_Pi = mask_predictions.unsqueeze(-1) * mask_Pi
+    den_Pj = mask_predictions.unsqueeze(-1) * mask_Pj
 
     Zs, P_joints = arnold_gokhale_denominator(vocab_Pi, vocab_Pj, vocab_size = vocab_size)
     # Zs.shape = (len(batch)*N_combinations(len(spans), 2), max_len_entities, max_len_entities)
@@ -669,9 +631,16 @@ def compute_mutual_information(traces: torch.Tensor, pdets: torch.Tensor, radii:
     num_Pj_agg = and_operation(num_Pj, dim = -1).pow(p_minkowski).mean(dim = -1).pow(1/p_minkowski)
     P_joints_agg = and_operation(P_joints, dim = -1).pow(p_minkowski).mean(dim = -1).pow(1/p_minkowski)
     Zs_agg = and_operation(Zs, dim = -1).pow(p_minkowski).mean(dim = -1).pow(1/p_minkowski)
-    c1_agg = 2 / (Zs_agg - num_Pi_agg - num_Pj_agg + EPS) * (torch.log((den_Pi_agg + den_Pj_agg + EPS) / (Zs_agg - num_Pi_agg - num_Pj_agg + EPS)) + 2 / (den_Pi_agg + den_Pj_agg + EPS))
+    alpha_i = (num_Pi_agg + num_Pj_agg) / (Zs_agg*num_Pj_agg + EPS)
+    alpha_j = (num_Pj_agg + num_Pi_agg) / (Zs_agg*num_Pi_agg + EPS)
 
-    smits = math.sqrt(embedding_size/2) * c1_agg.pow(2) * (torch.sqrt(agg_pdet[::2] * agg_radius[::2] / agg_trace[::2]) + torch.sqrt(agg_pdet[1::2] * agg_radius[1::2] / agg_trace[1::2]))
+    internal_log = torch.log((alpha_i*den_Pi_agg + alpha_j*den_Pj_agg + EPS)/(den_Pi_agg**2 + den_Pj_agg**2 + EPS))
+    internal_term_i = (Zs_agg - num_Pi_agg**2 - 1)/(num_Pi_agg*num_Pj_agg*(Zs_agg**2) + EPS)
+    internal_term_j = (Zs_agg - num_Pj_agg**2 - 1)/(num_Pi_agg*num_Pj_agg*(Zs_agg**2) + EPS)
+    Ci_agg = alpha_i**2 * ((internal_log + internal_term_i)**2 - 1)
+    Cj_agg = alpha_j**2 * ((internal_log + internal_term_j)**2 - 1)
+
+    smits = 2*math.sqrt(embedding_size*2) * Zs_agg.pow(-2) *(Ci_agg*torch.sqrt(agg_pdet[::2] * agg_radius[::2] / agg_trace[::2]) + Cj_agg*torch.sqrt(agg_pdet[1::2] * agg_radius[1::2] / agg_trace[1::2]))
 
     if torch.isnan(smits).any():
         warnings.warn("NaN values in smits")
@@ -721,7 +690,7 @@ def get_combination_indices_with_repeats(lists, num_indices_per_doc=None):
 
 
 @timing_decorator
-def main(test: bool = False, model_name: str = None, with_mbrd: bool = False, devices: List[str] = None):
+def main(test: bool = False, model_name: str = None, with_mbrd: bool = False, with_baselines: bool = False, devices: List[str] = None):
     
     print(f"Scoring model: {model_name}")
     if devices is not None:
@@ -732,7 +701,17 @@ def main(test: bool = False, model_name: str = None, with_mbrd: bool = False, de
     training_data = load_dataset("xiaobendanyn/tacred", split = "train")
     data = load_dataset("xiaobendanyn/tacred", split = "test")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    encoder_name = "transformer" if "distilbert" in model_name else "encoder"
+
+    if "distilbert" in model_name.lower():
+        encoder_name = "transformer"
+    elif "electra" in model_name.lower():
+        encoder_name = ["embeddings_project", "encoder"]
+    elif "llama" in model_name.lower():
+        encoder_name = "layers"
+    elif "phi" in model_name.lower():
+        encoder_name = "layers"
+    else:
+        encoder_name = "encoder"
     
     train_df = pd.DataFrame([json.loads(d['text']) for d in training_data]).map(lambda x: x['name'] if isinstance(x, dict) else " ".join(x) if isinstance(x, list) else x)
     df = pd.DataFrame([json.loads(d['text']) for d in data]).map(lambda x: x['name'] if isinstance(x, dict) else " ".join(x) if isinstance(x, list) else x)
@@ -812,7 +791,7 @@ def main(test: bool = False, model_name: str = None, with_mbrd: bool = False, de
         work_device = train_device if work_device is None else _resolve_torch_device(work_device)
         mlm_use = mlm_by_device[work_device] if mlm_for_pass is None else mlm_for_pass
         ner_use = ner_by_device[work_device] if ner_for_pass is None else ner_for_pass
-        if work_device.type == "cuda":
+        if getattr(work_device, "type", None) == "cuda":
             torch.cuda.set_device(work_device)
 
         pullback_dict, entity_span_combinations, entity_spans, valid_document_numbers = forward_backward_pass(
@@ -841,15 +820,23 @@ def main(test: bool = False, model_name: str = None, with_mbrd: bool = False, de
         mi, pointwise_mi = compute_mutual_information(pullback_dict["traces"], pullback_dict["pdets"], pullback_dict["radii"], pullback_dict["cond_probas"], pullback_dict["mask_probas"], separators)
         print(mi.shape)
 
-        # Normalize scores to make them intelligible
+        entity_eigenvectors = pullback_dict.pop("eigenvectors").detach().cpu()
+        radii = pullback_dict.pop("radii").detach().cpu()
+        traces = pullback_dict.pop("traces").detach().cpu()
+
+        del separators, slice_indices, pullback_dict, ner_use
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        # Mean Integrated Directional Gradients baseline
+        if with_baselines:
+            mean_idg_scores = mean_integrated_directional_gradients(mlm_use, batch, tokenizer, entity_span_combinations, M = 10)
+            shap_iq_scores = [tup[0] for tup in shapley_interaction_quantification(mlm_use, batch, tokenizer, entity_spans)]
 
         current_pos = 0
         batch_results = []
         retokenized_batch = tokenizer(batch, padding = "max_length", add_special_tokens = False, max_length = model.config.max_position_embeddings - 2 if hasattr(model.config, "max_position_embeddings") else model.config.n_ctx - 2, truncation=True, return_tensors = "pt")
         entity_embeddings = mlm_use.model.base_model.embeddings(retokenized_batch.input_ids.to(mlm_use.model.base_model.device)).detach().cpu()
-        entity_eigenvectors = pullback_dict.pop("eigenvectors").detach().cpu()
-        radii = pullback_dict.pop("radii").detach().cpu()
-        traces = pullback_dict.pop("traces").detach().cpu()
 
         # Pre-tokenize each sentence once instead of re-tokenizing per (entity, span) pair below.
         batch_token_lists = [tokenizer.tokenize(s, add_special_tokens=False) for s in batch]
@@ -874,6 +861,8 @@ def main(test: bool = False, model_name: str = None, with_mbrd: bool = False, de
                     "e_j_tokens": " ".join(sent_tokens[span_combo[1][0]:span_combo[1][1]]),
                     "score": mi[current_pos + j].to(dtype = torch.float64).item(),
                     "pointwise_baseline": pointwise_mi[current_pos + j].to(dtype = torch.float64).item(),
+                    "mean_idg_baseline": mean_idg_scores[current_pos + j].to(dtype = torch.float64).item() if with_baselines else -1.0,
+                    "shap_iq_baseline": shap_iq_scores[current_pos + j].to(dtype = torch.float64).item() if with_baselines else -1.0,
                     "original_text": batch[i],
                     "doc_number": running_index + valid_document_numbers[i],
                     "e_i_embeddings": entity_embeddings[i][span_combo[0][0]:span_combo[0][1]],
@@ -901,7 +890,7 @@ def main(test: bool = False, model_name: str = None, with_mbrd: bool = False, de
         work_device: torch.device = None,
     ):
         work_device = train_device if work_device is None else _resolve_torch_device(work_device)
-        if work_device.type == "cuda":
+        if getattr(work_device, "type", None) == "cuda":
             torch.cuda.set_device(work_device)
 
         # Each entity embedding is a tensor of size (len_entity, embedding_size)
@@ -956,7 +945,7 @@ def main(test: bool = False, model_name: str = None, with_mbrd: bool = False, de
 
             print(f"Processed {len(full_results)} examples", flush = True)
             results_to_save = [{k:v for k,v in d.items() if not isinstance(v, torch.Tensor)} for d in full_results]
-            with open(f"../results/tacred_scores_{model_name.replace('/', '___')}.json", "w") as f:
+            with open(f"../results/tacred_scores_{model_name.replace('/', '___')}.json", "w", encoding = "utf-8") as f:
                 json.dump(results_to_save, f)
     else:
         for i,batch in enumerate(batch_generator(ex, batch_size)):
@@ -974,7 +963,7 @@ def main(test: bool = False, model_name: str = None, with_mbrd: bool = False, de
 
             results_to_save = [{k:v for k,v in d.items() if not isinstance(v, torch.Tensor)} for d in full_results]
 
-            with open(f"../results/tacred_scores_{model_name.replace('/', '___')}.json", "w") as f:
+            with open(f"../results/tacred_scores_{model_name.replace('/', '___')}.json", "w", encoding = "utf-8") as f:
                 json.dump(results_to_save, f)
 
     # MBR DECODING
@@ -1003,7 +992,7 @@ def main(test: bool = False, model_name: str = None, with_mbrd: bool = False, de
             )
 
             print(f"Processed {len(full_results_mbrd)} examples", flush = True)
-            with open(f"../results/tacred_scores_{model_name.replace('/', '___')}_mbrd.json", "w") as f:
+            with open(f"../results/tacred_scores_{model_name.replace('/', '___')}_mbrd.json", "w", encoding = "utf-8") as f:
                 json.dump(full_results_mbrd, f)
 
 
@@ -1013,8 +1002,9 @@ if __name__ == "__main__":
     parser.add_argument("--test", action="store_true", default=False)
     parser.add_argument("--model-name", type=str, default="tanaos/tanaos-NER-v1")
     parser.add_argument("--mbrd", action="store_true", default=False)
+    parser.add_argument("--baselines", action="store_true", default=False)
     parser.add_argument("--device", type=str, default=None)
     args = parser.parse_args()
 
     devices = args.device.split("-") if args.device is not None else None
-    main(test=args.test, model_name=args.model_name, with_mbrd=args.mbrd, devices=devices)
+    main(test=args.test, model_name=args.model_name, with_mbrd=args.mbrd, with_baselines=args.baselines, devices=devices)
