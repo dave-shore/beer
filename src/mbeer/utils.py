@@ -1,6 +1,7 @@
 import time
 import functools
 from typing import Callable, Any, Iterable
+from difflib import SequenceMatcher
 
 
 def timing_decorator(func: Callable) -> Callable:
@@ -37,3 +38,17 @@ def batch_generator(iterable: Iterable, batch_size: int) -> Iterable:
     """
     for i in range(0, len(iterable), batch_size):
         yield iterable[i:i+batch_size]
+
+def _find_tokens(s, query, encoding):
+        result = []
+        for match in SequenceMatcher(None, s, query).get_matching_blocks():
+            char_start = match.a
+            char_end = match.a + match.size
+            ts = encoding.char_to_token(char_start)
+            if ts is None:
+                continue
+            te = encoding.char_to_token(char_end - 1)
+            if te is None:
+                continue
+            result.append((ts, te + 1))
+        return result

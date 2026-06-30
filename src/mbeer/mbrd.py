@@ -213,7 +213,6 @@ class CustomMetric(Metric):
         alignment_kwargs: Optional[Dict[str, Any]] = field(default_factory=dict)
 
     def __init__(self, cfg):
-        super().__init__(cfg)
 
         self.device = (
             "cuda"
@@ -241,6 +240,8 @@ class CustomMetric(Metric):
         self.nli_model = QKScore(
             tokenizer=self.tokenizer, model=self.model, device=self.device
         )
+
+        super().__init__(cfg)
 
     def score(
         self,
@@ -731,13 +732,19 @@ class RelationDisambiguation:
         hypotheses: List[str],
         topk: int = 5,
         batch_size: int = 16,
+        **kwargs: Any,
     ):
 
         self.model_name = model_name
         self.topk = topk
         self.batch_size = batch_size
 
-        metric_cfg = CustomMetric.Config(model_name=model_name)
+        metric_cfg = CustomMetric.Config(
+            model_name_or_path=model_name,
+            embedding_module_name=kwargs.get("embedding_module_name", "embeddings"),
+            encoder_module_name=kwargs.get("encoder_module_name", "encoder"),
+            classifier_module_name=kwargs.get("classifier_module_name", "classifier")
+        )
         self.metric = CustomMetric(metric_cfg)
         decoder_cfg = DecoderProbabilisticMBR.Config()
         self.decoder = DecoderProbabilisticMBR(decoder_cfg, self.metric)

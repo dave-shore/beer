@@ -61,9 +61,8 @@ cd ../src/mbeer
 
 models=(
     "numind/NuNER-v2.0"
-    "SIRIS-Lab/citation-parser-ENTITY"
     "rv2307/electra-small-ner"
-    "peoplek/Llama-3.2-1B-NER"
+    "dslim/bert-base-NER"
 )
 
 # Resolve which model this array task is responsible for. Outside SLURM we
@@ -79,5 +78,5 @@ model_name=$(echo "$model" | tr '/' '-')
 # SLURM allocates exactly one GPU to this task and exposes it via
 # CUDA_VISIBLE_DEVICES, so we don't have to manage device assignment ourselves.
 echo "Array task $task_id: scoring $model on GPU(s)=${CUDA_VISIBLE_DEVICES:-<unset>}"
-python3 scoring.py --mbrd --model-name "$model" \
+python3 scoring.py --mbrd --baselines --model-name "$model" \
     >& "scoring-${model_name}.out.log"

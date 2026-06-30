@@ -20,6 +20,16 @@
             "type": "python",
             "request": "attach",
             "connect": {
+                "host": "elm81",
+                "port": 5678
+            },
+            "justMyCode": false
+        },
+        {
+            "name": "Llama scoring",
+            "type": "python",
+            "request": "attach",
+            "connect": {
                 "host": "elm44",
                 "port": 5678
             },

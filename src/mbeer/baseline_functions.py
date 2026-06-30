@@ -3,7 +3,8 @@
 from typing import List, Optional, Sequence, Tuple, Union
 import gc
 import os
-
+from itertools import chain
+import warnings
 import numpy as np
 from shapiq import Game, KernelSHAPIQ
 from shapiq.interaction_values import InteractionValues
@@ -12,11 +13,24 @@ from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 from transformers import AutoModelForMaskedLM, AutoTokenizer
 
-from mbeer.pullback import (
-    OutputOnlyModel,
-    compute_pred_ids_and_eq_class_emb_ids,
-    jacobian,
-)
+try:
+    from .pullback import (
+        OutputOnlyModel,
+        compute_pred_ids_and_eq_class_emb_ids,
+        jacobian,
+    )
+except ImportError:
+    import sys
+    from pathlib import Path
+
+    src_path = Path(__file__).parent.parent.parent / "src"
+    if str(src_path) not in sys.path:
+        sys.path.insert(0, str(src_path))
+    from pullback import (
+        OutputOnlyModel,
+        compute_pred_ids_and_eq_class_emb_ids,
+        jacobian,
+    )
 
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
@@ -85,22 +99,52 @@ def _preprocess_batch(
     )
 
     #### PRED_IDS has one record per entity span and one per entity span combination, and the same will apply to EQ_CLASS_EMB_IDS
-    repetitions = torch.as_tensor([len(ent_span_list) + len(span_combo_list) for ent_span_list, span_combo_list in zip(entity_spans, entity_span_combinations)])
-    extended_embedded_batch = torch.repeat_interleave(embedded_batch, repetitions.to(embedded_batch.device), dim=0)
-    extended_attention_mask = torch.repeat_interleave(tokenized_batch.attention_mask, repetitions.to(tokenized_batch.attention_mask.device), dim=0)
+    repetitions = torch.as_tensor(
+        [
+            len(ent_span_list) + len(span_combo_list)
+            for ent_span_list, span_combo_list in zip(
+                entity_spans, entity_span_combinations
+            )
+        ]
+    )
+    extended_embedded_batch = torch.repeat_interleave(
+        embedded_batch, repetitions.to(embedded_batch.device), dim=0
+    )
+    extended_attention_mask = torch.repeat_interleave(
+        tokenized_batch.attention_mask,
+        repetitions.to(tokenized_batch.attention_mask.device),
+        dim=0,
+    )
 
     m_ratios = (
-        torch.linspace(0, 1, M + 1).reshape(1, -1, 1, 1).tile(extended_embedded_batch.shape[0], 1, max_len, 1)
+        torch.linspace(0, 1, M + 1)
+        .reshape(1, -1, 1, 1)
+        .tile(extended_embedded_batch.shape[0], 1, max_len, 1)
     )  # shape = (1, M+1)
     for i, span_list in enumerate(entity_spans):
         for span in span_list:
             m_ratios[i, :, span[0] : span[1]] = 1.0
-            
-    extended_embedded_batch = (extended_embedded_batch * m_ratios.to(extended_embedded_batch.device)).reshape(-1, max_len, embedding_size).to("cpu")
-    extended_attention_mask = extended_attention_mask.repeat_interleave(M + 1, dim=0).to("cpu")
-    extended_pred_ids = pred_ids.repeat_interleave(M + 1, dim=0).to("cpu")
 
-    local_dataset = TensorDataset(extended_embedded_batch, extended_attention_mask, extended_pred_ids)
+    extended_embedded_batch = (
+        (extended_embedded_batch * m_ratios.to(extended_embedded_batch.device))
+        .flatten(end_dim=1)
+        .to("cpu")
+    )
+    # extended_embeddedbatch.shape = (expanded_batch_size*(M+1), max_len, embedding_size)
+    extended_attention_mask = extended_attention_mask.repeat_interleave(
+        M + 1, dim=0
+    ).to("cpu")
+    extended_pred_ids = pred_ids.repeat_interleave(M + 1, dim=0).to("cpu")
+    extended_eq_class_emb_ids = eq_class_emb_ids.repeat_interleave(M + 1, dim=0).to(
+        "cpu"
+    )
+
+    local_dataset = TensorDataset(
+        extended_embedded_batch,
+        extended_attention_mask,
+        extended_pred_ids,
+        extended_eq_class_emb_ids,
+    )
 
     return {
         "output_only_model": output_only_model,
@@ -114,6 +158,8 @@ def _preprocess_batch(
         "batch_size": batch_size,
         "max_len": max_len,
         "embedding_size": embedding_size,
+        "minibatch_size": minibatch_size,
+        "num_workers": num_workers,
     }
 
 
@@ -122,8 +168,8 @@ def mean_integrated_directional_gradients(
     batch: List[str],
     tokenizer: AutoTokenizer,
     entity_span_combinations: List[List[Tuple[int, int]]],
-    max_tokens_per_entity: int = 8,
-    M: int = 10,
+    max_tokens_per_entity: int = 5,
+    M: int = 9,
     minibatch_size: int = 4,
     num_workers: int = 2,
     encoder_name="encoder",
@@ -155,15 +201,20 @@ def mean_integrated_directional_gradients(
         num_workers,
         encoder_name=encoder_name,
     )
-    local_dataloader = DataLoader(batch_dict["local_dataset"], batch_size=minibatch_size, shuffle=False, pin_memory=True, num_workers=num_workers)
+    local_dataloader = DataLoader(
+        batch_dict["local_dataset"],
+        batch_size=minibatch_size,
+        shuffle=False,
+        pin_memory=True,
+        num_workers=num_workers,
+    )
     output_only_model = batch_dict["output_only_model"]
     output_only_model.eval()
     output_only_model.requires_grad_(False)
 
-    pred_ids = batch_dict["pred_ids"]
-    eq_class_emb_ids = batch_dict["eq_class_emb_ids"]
+    pred_ids = []
+    eq_class_emb_ids = []
     embedded_batch = batch_dict["embedded_batch"]
-    batch_size = embedded_batch.shape[0]
     embedding_size = embedded_batch.shape[-1]
     entity_span_combinations = batch_dict["entity_span_combinations"]
     entity_spans = batch_dict["entity_spans"]
@@ -174,16 +225,44 @@ def mean_integrated_directional_gradients(
     for minibatch in tqdm(
         local_dataloader, desc="Mean Integrated Directional Gradients"
     ):
-        minibatch_inputs, minibatch_attn_mask, minibatch_pred_ids = minibatch
+        (
+            minibatch_inputs,
+            minibatch_attn_mask,
+            minibatch_pred_ids,
+            minibatch_eq_class_emb_ids,
+        ) = minibatch
         minibatch_inputs = minibatch_inputs.to(output_only_model.device)
-        minibatch_attn_mask = minibatch_attn_mask.to(output_only_model.device)
+        minibatch_attn_mask = minibatch_attn_mask.to(
+            output_only_model.device, dtype=torch.bool
+        )
         minibatch_pred_ids = minibatch_pred_ids.to(output_only_model.device)
+        minibatch_eq_class_emb_ids = minibatch_eq_class_emb_ids.to(
+            output_only_model.device
+        )
 
-        truncation_mask = minibatch_attn_mask.any(dim = 0).squeeze()
+        truncation_mask = minibatch_attn_mask.any(dim=0).squeeze()
         minibatch_inputs = minibatch_inputs[:, truncation_mask]
         minibatch_attn_mask = minibatch_attn_mask[:, truncation_mask]
-        pred_ids_truncation_mask = torch.any(minibatch_pred_ids >= 0, dim = 0).squeeze()
+        pred_ids_truncation_mask = torch.any(minibatch_pred_ids >= 0, dim=0).squeeze()
         minibatch_pred_ids = minibatch_pred_ids[:, pred_ids_truncation_mask]
+        minibatch_eq_class_emb_ids = [
+            row[torch.logical_and(row >= 0, row < minibatch_attn_mask[i].sum())]
+            .unique()
+            .tolist()
+            for i, row in enumerate(minibatch_eq_class_emb_ids)
+        ]
+        eq_class_emb_ids.extend(minibatch_eq_class_emb_ids)
+        minibatch_pred_ids = tuple(
+            [
+                tuple(
+                    row[torch.logical_and(row >= 0, row < minibatch_attn_mask[i].sum())]
+                    .unique()
+                    .tolist()
+                )
+                for i, row in enumerate(minibatch_pred_ids)
+            ]
+        )
+        pred_ids.extend(minibatch_pred_ids)
 
         jac, preds = jacobian(
             minibatch_inputs,
@@ -196,7 +275,9 @@ def mean_integrated_directional_gradients(
         # preds.shape = (minibatch_size, max_len_pred_ids, 1)
         jac = jac.to("cpu")
         del preds
-        gradients.extend([J for J in jac.squeeze(2)])
+        gradients.extend(
+            [J.reshape(-1, J.shape[-2], embedding_size) for J in jac.squeeze(2)]
+        )
         torch.cuda.empty_cache()
         gc.collect()
 
@@ -204,39 +285,55 @@ def mean_integrated_directional_gradients(
     torch.cuda.empty_cache()
     gc.collect()
 
-    eq_class_emb_ids = [L * (M + 1) for L in eq_class_emb_ids]
+    eq_class_emb_ids = torch.nn.utils.rnn.pad_sequence(
+        [torch.as_tensor(L) for L in eq_class_emb_ids],
+        batch_first=True,
+        padding_value=-1,
+    ).to(dtype=torch.int32)
+    pred_ids = torch.nn.utils.rnn.pad_sequence(
+        [torch.as_tensor(L) for L in pred_ids], batch_first=True, padding_value=-1
+    ).to(dtype=torch.int32)
+    batch_size_expanded = eq_class_emb_ids.shape[0]
     max_pred_ids = max(map(len, pred_ids))
+    expanded_embedded_batch = local_dataloader.dataset.tensors[0]
+    assert batch_size_expanded == len(gradients) and batch_size_expanded == len(
+        expanded_embedded_batch
+    ), (
+        "Size of eq_class_emb_ids does not match number of gradients or expanded_embedded_batch"
+    )
 
     J = torch.nn.utils.rnn.pad_sequence(
-        [T[L[L < T.shape[0]]] for i, L in enumerate(eq_class_emb_ids) for T in gradients[i].reshape(-1, gradients[i].shape[-2], embedding_size)],
+        [
+            gradients[i][:, L, :].flatten(end_dim=1)
+            for i, L in enumerate(eq_class_emb_ids)
+        ],
         batch_first=True,
         padding_value=0,
-    ).reshape(batch_size, max_pred_ids, -1, embedding_size)
+    ).reshape(batch_size_expanded, max_pred_ids, -1, embedding_size)
 
     X = torch.nn.utils.rnn.pad_sequence(
-        [T for i, L in enumerate(eq_class_emb_ids) for T in embedded_batch[i, :, L, :]],
+        [expanded_embedded_batch[i, L, :] for i, L in enumerate(eq_class_emb_ids)],
         batch_first=True,
         padding_value=0,
-    ).reshape(batch_size, 1, -1, embedding_size)
+    ).unsqueeze(1)
 
     grad_dot_products = torch.sum(X * J, dim=-1)
-    chunks = torch.chunk(grad_dot_products, M + 1, dim=0)
+    chunks = torch.split(grad_dot_products, M + 1, dim=0)
     mean_integrated_gradients = []
     for chunk, combo_list, span_list in zip(
         chunks, entity_span_combinations, entity_spans
     ):
-        idg = chunk.mean(dim=0).flatten()
+        idg = chunk.mean(dim=0)
+        deltas = [end - start for start, end in span_list]
         span_map = {
             span: slice(
-                sum(end - start for start, end in span_list[:i]),
-                sum(end - start for start, end in span_list[: i + 1]),
+                sum(deltas[:i]) if i > 0 else 0,
+                sum(deltas[: i + 1]) if i < len(span_list) - 1 else sum(deltas),
             )
-            for i, span in enumerate(span_list)
+            for i, span in enumerate(sorted(span_list))
         }
         for combo in combo_list:
-            mean_idg = torch.cat(
-                [idg[span_map[combo[0]]], idg[span_map[combo[1]]]]
-            ).mean()
+            mean_idg = torch.mean(idg[span_map[combo[0]], span_map[combo[1]]])
             mean_integrated_gradients.append(mean_idg)
 
     return torch.stack(mean_integrated_gradients)
@@ -331,7 +428,9 @@ class MaskedLMShapleyGame(Game):
         )
 
         self.output_only_model = (
-            OutputOnlyModel(model, encoder_name=encoder_name).to(self.device).eval()
+            (OutputOnlyModel(model, encoder_name=encoder_name).to(self.device).eval())
+            if not isinstance(model, OutputOnlyModel)
+            else model.to(self.device).eval()
         )
 
         max_len = (
@@ -363,17 +462,18 @@ class MaskedLMShapleyGame(Game):
             None if bool(self.attention_mask.all()) else self.attention_mask
         )
 
-        for s, e in self.entity_spans:
-            if not (0 <= s < e <= self.seq_len):
-                raise ValueError(
-                    f"Invalid entity span ({s}, {e}); must satisfy "
-                    f"0 <= start < end <= {self.seq_len}."
-                )
+        for L in self.entity_spans:
+            for s, e in L:
+                if not (0 <= s < e <= self.seq_len):
+                    raise ValueError(
+                        f"Invalid entity span ({s}, {e}); must satisfy "
+                        f"0 <= start < end <= {self.seq_len}."
+                    )
 
         embedder = (
-            model.base_model.embeddings
-            if hasattr(model.base_model, "embeddings")
-            else model.base_model.embed_tokens
+            self.output_only_model.model.base_model.embeddings
+            if hasattr(self.output_only_model.model.base_model, "embeddings")
+            else self.output_only_model.model.base_model.embed_tokens
         )
         with torch.no_grad():
             self.input_embedding: torch.Tensor = embedder(
@@ -395,10 +495,10 @@ class MaskedLMShapleyGame(Game):
             target_pred_id, default=self.entity_spans, name="target_pred_id"
         )
         for p in self.target_pred_id:
-            if not (0 <= p < self.seq_len):
-                raise ValueError(
-                    f"target_pred_id {p} out of range [0, {self.seq_len})."
-                )
+            if not self._check_boundary(p):
+                warnings.warn(f"target_pred_id {p} out of range [0, {self.seq_len}).")
+                self.target_pred_id.remove(p)
+                self.target_pred_id.append(self.seq_len - 1)
 
         if target_token_id is None:
             with torch.no_grad():
@@ -432,15 +532,23 @@ class MaskedLMShapleyGame(Game):
             normalization_value = float(self._evaluate_coalitions(empty)[0])
 
         super().__init__(
-            n_players=n_players,
+            n_players,
             normalize=normalize,
             normalization_value=normalization_value,
-            player_names=entity_spans,
+            player_names=entity_spans[0],
             verbose=verbose,
         )
 
-    @staticmethod
+    def _check_boundary(self, p: int | Sequence[int]) -> bool:
+        if isinstance(p, int):
+            return 0 <= p < self.seq_len
+        elif isinstance(p, Sequence):
+            return all(self._check_boundary(pi) for pi in p)
+        else:
+            raise ValueError("`p` must be an int or a sequence of ints.")
+
     def _coerce_int_list(
+        self,
         x: Optional[Union[int, Sequence[int]]],
         default: Optional[Sequence[int]],
         name: str,
@@ -451,7 +559,14 @@ class MaskedLMShapleyGame(Game):
             if isinstance(default[0], (int, np.integer)):
                 return [int(v) for v in default]
             elif isinstance(default[0], (tuple, list)):
-                return [[int(v) for v in sublist] for sublist in default]
+                return list(
+                    chain(
+                        *[
+                            self._coerce_int_list(x=None, default=sublist, name=name)
+                            for sublist in default
+                        ]
+                    )
+                )
             else:
                 raise TypeError(
                     f"`{name}` must be a sequence of ints or tuples of ints."
@@ -459,7 +574,14 @@ class MaskedLMShapleyGame(Game):
         if isinstance(x, (int, np.integer)):
             return [int(x)]
         try:
-            return [int(v) for v in x]
+            return list(
+                chain(
+                    *[
+                        self._coerce_int_list(x=sublist, default=None, name=name)
+                        for sublist in x
+                    ]
+                )
+            )
         except TypeError as exc:
             raise TypeError(f"`{name}` must be an int or a sequence of ints.") from exc
 
@@ -469,10 +591,10 @@ class MaskedLMShapleyGame(Game):
         coalitions = np.asarray(coalitions, dtype=bool)
         if coalitions.ndim == 1:
             coalitions = coalitions[None, :]
-        if coalitions.shape[1] != len(self.entity_spans):
+        if coalitions.shape[1] != len(self.entity_spans[0]):
             raise ValueError(
                 f"Got coalitions with {coalitions.shape[1]} columns but the game "
-                f"has {len(self.entity_spans)} players."
+                f"has {len(self.entity_spans[0])} players."
             )
         n_coal = int(coalitions.shape[0])
 
@@ -482,7 +604,7 @@ class MaskedLMShapleyGame(Game):
         embedding_mask = torch.zeros(
             n_coal, self.seq_len, dtype=torch.bool, device=self.device
         )
-        for i, (s, e) in enumerate(self.entity_spans):
+        for i, (s, e) in enumerate(self.entity_spans[0]):
             embedding_mask[:, s:e] = embedding_mask[:, s:e] | (
                 ~coalitions_t[:, i : i + 1]
             )
@@ -507,7 +629,7 @@ class MaskedLMShapleyGame(Game):
             # batch_proba has shape (batch, n_targets, 1); average across target positions.
             results.append(batch_proba.reshape(batch_emb.shape[0], -1).mean(dim=-1))
 
-        return torch.cat(results, dim=0).to(torch.float32)
+        return torch.cat(results, dim=0).to(torch.get_default_dtype())
 
     def value_function(self, coalitions: np.ndarray) -> np.ndarray:
         """Compute the (un-normalized) game value of each coalition.
@@ -569,7 +691,6 @@ def shapley_interaction_quantification(
     for text, sent_entity_spans in tqdm(
         zip(batch, entity_spans), desc="Shapley Interaction Quantification"
     ):
-
         game = MaskedLMShapleyGame(
             model=model,
             tokenizer=tokenizer,

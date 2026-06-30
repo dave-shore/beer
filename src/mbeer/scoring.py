@@ -19,7 +19,6 @@ from datasets import load_dataset
 from huggingface_hub import HfApi
 import pandas as pd
 from scipy.stats import chi2
-from numpy import cumsum
 import torch
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
@@ -181,7 +180,12 @@ def pad_traces_and_eigenvectors(L: List[torch.Tensor]) -> torch.Tensor:
         # For tensors that combine two entities it doesn't matter, we treat them as left-padded
         L[i] = T
 
-    output = torch.cat(L)
+    # `torch.stack` (not `torch.cat`) so the per-element dimension becomes a new
+    # leading axis. Using `cat` here folded the combination/token axis into dim 0
+    # (e.g. (3*combinations*max_len, ...) instead of (3*combinations, max_len, ...)),
+    # which is the same mangling that affected `pdets`. Stacking keeps the array
+    # 3-per-combination so it can be triplet-indexed like traces/radii/pdets.
+    output = torch.stack(L)
 
     if torch.isnan(output).any():
         warnings.warn("NaN values in output")
@@ -816,6 +820,10 @@ def forward_backward_pass(
         independent_entity_separators = independent_entity_separators * 2
         dependent_entity_separators = dependent_entity_separators * 2
         new_order = new_order * 2
+        batch = batch * 2
+        valid_documents = valid_documents * 2
+        ent_spans = ent_spans * 2
+        span_combinations = span_combinations * 2
 
     # Initialize dataset and dataloader
     local_dataset = TensorDataset(
@@ -897,6 +905,8 @@ def forward_backward_pass(
             )
         )
 
+        min_rank = int(round(math.log(input_embeddings.shape[-1], 2)))
+
         (
             pullback_pdets,
             pullback_traces,
@@ -916,6 +926,7 @@ def forward_backward_pass(
             return_predictions=True,
             min_num_eigenvectors=min_num_eigenvectors,
             max_num_eigenvectors=max_num_eigenvectors,
+            min_rank=min_rank,
         )
         tqdm.write(f"Pullback pdets shape: {pullback_pdets.shape}")
         tqdm.write(f"Pullback traces shape: {pullback_traces.shape}")
@@ -1073,6 +1084,9 @@ def arnold_gokhale_denominator(
 def and_operation(x: torch.Tensor, dim: int = -1, eps_correction: float = 1e-6):
     """Exp-sum-log operation to avoid that too small values become 0 in an approximation of minimum or product."""
 
+    if not isinstance(x, torch.Tensor):
+        x = torch.as_tensor(x)
+
     max_value = x.max().item()
     mask = torch.logical_and(torch.isfinite(x), x > EPS)
     x = torch.where(mask, x, torch.ones_like(x) - EPS)  # Avoid 0 values
@@ -1125,6 +1139,9 @@ def compute_mutual_information(
         ).to(dtype=torch.int32)  # shape = (batch_size, max_len)
 
     dependent_entity_separators = dependent_entity_separators.cumsum(dim=1)
+    dependent_entity_separators_i = dependent_entity_separators[::3]
+    dependent_entity_separators_j = dependent_entity_separators[1::3]
+    dependent_entity_separators_ij = dependent_entity_separators[2::3]
 
     cond_probas_i = torch.nn.functional.normalize(cond_probas_i, dim=-1, p=1)
     cond_probas_j = torch.nn.functional.normalize(cond_probas_j, dim=-1, p=1)
@@ -1144,33 +1161,40 @@ def compute_mutual_information(
         .reshape(1, -1)
         .expand(mask_predictions.shape[0], -1)
     )
-    mask_Pi = torch.where(
-        positions_of_predictions < dependent_entity_separators[::3, 0], 1, 0
+    mask_Pi_num = torch.where(
+        positions_of_predictions < dependent_entity_separators_i[:, 0], 1, 0
     ).unsqueeze(-1)
     mask_Pj_num = torch.where(
-        positions_of_predictions < dependent_entity_separators[1::3, 1], 1, 0
+        positions_of_predictions < dependent_entity_separators_j[:, 1], 1, 0
+    ).unsqueeze(-1)
+
+    mask_Pi_den = torch.where(
+        positions_of_predictions < dependent_entity_separators_ij[:, 0], 1, 0
     ).unsqueeze(-1)
     mask_Pj_den = torch.where(
         torch.logical_and(
-            positions_of_predictions >= dependent_entity_separators[2::3, 0],
-            positions_of_predictions < dependent_entity_separators[2::3, 1],
+            positions_of_predictions >= dependent_entity_separators_ij[:, 0],
+            positions_of_predictions < dependent_entity_separators_ij[:, 1],
         ),
         1,
         0,
     ).unsqueeze(-1)
 
     # cond_probas.shape = (len(batch)*N_combinations(len(spans), 2), max_len_entities, selected_vocab_size)
-    vocab_Pi = cond_probas_i * mask_Pi[:, : cond_probas_i.shape[1], :]
+    vocab_Pi = cond_probas_i * mask_Pi_num[:, : cond_probas_i.shape[1], :]
     vocab_Pj = cond_probas_j * mask_Pj_num[:, : cond_probas_j.shape[1], :]
     num_Pi = (
-        cond_predictions_i.unsqueeze(-1) * mask_Pi[:, : cond_predictions_i.shape[1], :]
+        cond_predictions_i.unsqueeze(-1)
+        * mask_Pi_num[:, : cond_predictions_i.shape[1], :]
     )
     num_Pj = (
         cond_predictions_j.unsqueeze(-1)
         * mask_Pj_num[:, : cond_predictions_j.shape[1], :]
     )
     num_Pj = num_Pj.transpose(-2, -1)
-    den_Pi = mask_predictions.unsqueeze(-1) * mask_Pi[:, : mask_predictions.shape[1], :]
+    den_Pi = (
+        mask_predictions.unsqueeze(-1) * mask_Pi_den[:, : mask_predictions.shape[1], :]
+    )
     den_Pj = (
         mask_predictions.unsqueeze(-1) * mask_Pj_den[:, : mask_predictions.shape[1], :]
     )
@@ -1196,8 +1220,8 @@ def compute_mutual_information(
         (0, max_P_shape - P_joints.shape[-1], 0, max_P_shape - P_joints.shape[-2]),
         value=0,
     )
-    alpha_i = (1 + num_Pi / (num_Pj + EPS)) / (Zs + EPS)
-    alpha_j = (1 + num_Pj / (num_Pi + EPS)) / (Zs + EPS)
+    alpha_i = (1 - num_Pi / (num_Pj + EPS)) / (Zs + EPS)
+    alpha_j = (1 - num_Pj / (num_Pi + EPS)) / (Zs + EPS)
     # alpha.shape = (N_combinations, max_len_entities, max_len_entities)
 
     internal_log = torch.log(
@@ -1205,13 +1229,20 @@ def compute_mutual_information(
     )
     internal_term_j = num_Pi - den_Pi
     internal_term_i = num_Pj - den_Pj
-    Ci = alpha_i**2 * ((internal_log + internal_term_i) ** 2 - 1) / (Zs**2 + EPS)
-    Cj = alpha_j**2 * ((internal_log + internal_term_j) ** 2 - 1) / (Zs**2 + EPS)
+    Ci = alpha_j**2 * ((internal_log + internal_term_i) ** 2 - 1) / (Zs**2 + EPS)
+    Cj = alpha_i**2 * ((internal_log + internal_term_j) ** 2 - 1) / (Zs**2 + EPS)
 
     # C*.shape = (N_combinations, max_len_entities, max_len_entities)
 
-    I_stretch = radii[::2] / traces[::2]
-    J_stretch = radii[1::2] / traces[1::2]
+    # traces/radii/pdets are stored 3-per-combination in the triplet layout
+    # [I|J, J|I, J|I_dup] (see `pullback`). The I-geometry (I|J) lives at
+    # stride-3 offset 0 and the J-geometry (J|I) at offset 1 -- matching how
+    # `dependent_entity_separators` and the predictions are sliced
+    # (`[::3]`, `[1::3]`, `[2::3]`). The previous stride-2 (`[::2]`/`[1::2]`)
+    # silently misaligned I/J rows (and only worked by accident via the
+    # `take_along_dim` truncation below).
+    I_stretch = radii[::3] / traces[::3]
+    J_stretch = radii[1::3] / traces[1::3]
     I_stretch = torch.where(
         torch.isfinite(I_stretch), I_stretch, torch.ones_like(I_stretch)
     )
@@ -1219,8 +1250,8 @@ def compute_mutual_information(
         torch.isfinite(J_stretch), J_stretch, torch.ones_like(J_stretch)
     )
 
-    pdets_i = pdets[::2]
-    pdets_j = pdets[1::2]
+    pdets_i = pdets[::3]
+    pdets_j = pdets[1::3]
 
     for i, (s1, s2) in enumerate(zip(Ci.shape, I_stretch.shape)):
         if s1 < s2:
@@ -1387,6 +1418,7 @@ def main(
     with_mbrd: bool = False,
     with_baselines: bool = False,
     devices: List[str] = None,
+    insert_negative_samples: bool = True,
 ):
 
     print(f"Scoring model: {model_name}")
@@ -1526,6 +1558,7 @@ def main(
             max_num_eigenvectors=max_num_eigenvectors,
             max_retained_vocab=max_retained_vocab,
             encoder_name=encoder_name,
+            insert_negative_samples=insert_negative_samples,
         )
         # In the dictionary, pred_probas and mask_probas have 1/3 of the size of the other tensors
 
@@ -1546,7 +1579,10 @@ def main(
         ]
         filtered_batch = pullback_dict.pop("filtered_batch")
         dependent_entity_separators = pullback_dict.pop("dependent_entity_separators")
-        total_combinations = sum(len(combos) for combos in entity_span_combinations)
+        if insert_negative_samples:
+            pos_or_neg = ["pos"] * (len(valid_document_numbers) // 2) + ["neg"] * (
+                len(valid_document_numbers) // 2
+            )
 
         if any(
             res is None
@@ -1568,6 +1604,45 @@ def main(
             ],
             batch_first=True,
         ).to(dtype=torch.int32)  # shape = (batch_size, max_len)
+
+        # Set BEER_DEBUG_PULLBACK=1 to dump the shapes and the fraction of
+        # zero / NaN entries of the quantities feeding the scoring, plus the
+        # number of entity-pair combinations. This is the cheapest way to
+        # confirm whether `radii`/`traces`/`pdets` are stored with a different
+        # stride (e.g. 3*n_combinations) than the way they are indexed in
+        # `compute_mutual_information` (stride 2) and the result loop (stride 1).
+        if os.environ.get("BEER_DEBUG_PULLBACK"):
+            n_combinations = sum(len(c) for c in entity_span_combinations)
+            print(
+                f"[debug] n_combinations={n_combinations} "
+                f"len(dependent_entity_separators)={len(dependent_entity_separators)}",
+                flush=True,
+            )
+            for _name in [
+                "traces",
+                "pdets",
+                "radii",
+                "eigenvectors",
+                "cond_probas_i",
+                "cond_probas_j",
+                "mask_probas",
+            ]:
+                _v = pullback_dict[_name]
+                if isinstance(_v, torch.Tensor):
+                    _t = _v.detach().float()
+                    print(
+                        f"[debug] {_name:14s} shape={tuple(_v.shape)} "
+                        f"zero%={(_t == 0).float().mean().item():.3f} "
+                        f"nan%={torch.isnan(_t).float().mean().item():.3f}",
+                        flush=True,
+                    )
+                else:
+                    _shapes = [tuple(t.shape) for t in _v[:4]]
+                    print(
+                        f"[debug] {_name:14s} list len={len(_v)} "
+                        f"first_shapes={_shapes}",
+                        flush=True,
+                    )
 
         mi_dict = compute_mutual_information(
             pullback_dict["traces"],
@@ -1592,9 +1667,8 @@ def main(
         )  # shape = (total_combinations,)
 
         entity_eigenvectors = pullback_dict.pop("eigenvectors").detach().cpu()
-        entity_eigenvectors = entity_eigenvectors.reshape(
-            total_combinations, -1, *entity_eigenvectors.shape[-3:]
-        )  # shape = (total_combinations, 2*num_tokens_in_i, 2*num_tokens_in_j, num_eigenvectors, embedding_size)
+        # shape = (3*total_combinations, max_len, max_pred_ids, num_eigenvectors, embedding_size)
+        # i.e. 3-per-combination triplets [I|J, J|I, J|I_dup], indexed at 3*(current_pos+j) below.
         radii = (
             pullback_dict.pop("radii")
             .detach()
@@ -1661,11 +1735,13 @@ def main(
                     encoder_name=encoder_name,
                 )
             ]
-            shap_iq_scores = [
-                (single_scores[i] + single_scores[j]) / 2
-                for single_scores in shap_iq_scores_single
-                for i, j in combinations(range(len(single_scores)), 2)
-            ]
+            shap_iq_scores = torch.as_tensor(
+                [
+                    (single_scores[i] + single_scores[j]) / 2
+                    for single_scores in shap_iq_scores_single
+                    for i, j in combinations(range(len(single_scores)), 2)
+                ]
+            )
 
             mlm_use = mlm_use.to(work_device)
             mlm_use.requires_grad_(True)
@@ -1702,88 +1778,122 @@ def main(
             k = len(sent_span_combinations)
 
             sent_tokens = batch_token_lists[i]
-            entity_pairs_scores = [
-                {
-                    "e_i_idx": list(span_combo[0]),
-                    "e_j_idx": list(span_combo[1]),
-                    "e_i_tokens": " ".join(
-                        sent_tokens[span_combo[0][0] : span_combo[0][1]]
-                    ),
-                    "e_j_tokens": " ".join(
-                        sent_tokens[span_combo[1][0] : span_combo[1][1]]
-                    ),
-                    "score_mean": mi[current_pos + j]
-                    .to("cpu", dtype=torch.float64)
-                    .item(),
-                    "score_frob": mi_frob[current_pos + j]
-                    .to("cpu", dtype=torch.float64)
-                    .item(),
-                    "score_andin_orout": smits_andin_orout[current_pos + j]
-                    .to("cpu", dtype=torch.float64)
-                    .item(),
-                    "score_andout_orin": smits_andout_orin[current_pos + j]
-                    .to("cpu", dtype=torch.float64)
-                    .item(),
-                    "pointwise_baseline": pointwise_mi[current_pos + j]
-                    .to("cpu", dtype=torch.float64)
-                    .item(),
-                    "mean_idg_baseline": mean_idg_scores[current_pos + j]
-                    .to("cpu", dtype=torch.float64)
-                    .item()
-                    if with_baselines
-                    else -1.0,
-                    "shap_iq_baseline": shap_iq_scores[current_pos + j]
-                    if with_baselines
-                    else -1.0,
-                    "original_text": filtered_batch[i],
-                    "doc_number": valid_document_numbers[i],
-                    "e_i_embeddings": entity_embeddings[i][
-                        span_combo[0][0] : span_combo[0][1]
-                    ].to("cpu", dtype=torch.float64),
-                    "e_i_eigenvectors": entity_eigenvectors[i][
-                        : dependent_entity_separators[current_pos + j][0]
-                    ].to("cpu", dtype=torch.float64),
-                    "e_i_probas_joint": cond_probas_i[current_pos + j][
-                        : dependent_entity_separators[current_pos + j][0]
-                    ].to("cpu", dtype=torch.float64),
-                    "e_j_probas_joint": cond_probas_j[current_pos + j][
-                        dependent_entity_separators[current_pos + j][0] :
-                    ].to("cpu", dtype=torch.float64),
-                    "e_i_probas_prod": mask_probas[current_pos + j][
-                        : dependent_entity_separators[current_pos + j][0]
-                    ].to("cpu", dtype=torch.float64),
-                    "e_j_probas_prod": mask_probas[current_pos + j][
-                        dependent_entity_separators[current_pos + j][0] :
-                    ].to("cpu", dtype=torch.float64),
-                    "e_i_pdets": pdets[current_pos + j][
-                        : dependent_entity_separators[current_pos + j][0]
-                    ].to("cpu", dtype=torch.float64),
-                    "e_j_pdets": pdets[current_pos + j][
-                        dependent_entity_separators[current_pos + j][0] :
-                    ].to("cpu", dtype=torch.float64),
-                    "e_i_traces": traces[current_pos + j][
-                        : dependent_entity_separators[current_pos + j][0]
-                    ].to("cpu", dtype=torch.float64),
-                    "e_j_traces": traces[current_pos + j][
-                        dependent_entity_separators[current_pos + j][0] :
-                    ].to("cpu", dtype=torch.float64),
-                    "e_i_radii": radii[current_pos + j][
-                        : dependent_entity_separators[current_pos + j][0]
-                    ].to("cpu", dtype=torch.float64),
-                    "e_j_radii": radii[current_pos + j][
-                        dependent_entity_separators[current_pos + j][0] :
-                    ].to("cpu", dtype=torch.float64),
-                    "e_j_embeddings": entity_embeddings[i][
-                        span_combo[1][0] : span_combo[1][1]
-                    ].to("cpu", dtype=torch.float64),
-                    "e_j_eigenvectors": entity_eigenvectors[i][
-                        dependent_entity_separators[current_pos + j][0] :
-                    ].to("cpu", dtype=torch.float64),
-                }
-                for j, span_combo in enumerate(sent_span_combinations)
-            ]
+            text = filtered_batch[i]
+            sent_embeddings = entity_embeddings[i].to("cpu", dtype=torch.float64)
+            doc_number = valid_document_numbers[i]
+            sent_label = pos_or_neg[i]
+            sent_mi = mi[current_pos : current_pos + k].to("cpu", dtype=torch.float64)
+            sent_mi_frob = mi_frob[current_pos : current_pos + k].to(
+                "cpu", dtype=torch.float64
+            )
+            sent_smits_andin_orout = smits_andin_orout[
+                current_pos : current_pos + k
+            ].to("cpu", dtype=torch.float64)
+            sent_smits_andout_orin = smits_andout_orin[
+                current_pos : current_pos + k
+            ].to("cpu", dtype=torch.float64)
+            sent_pointwise_mi = pointwise_mi[current_pos : current_pos + k].to(
+                "cpu", dtype=torch.float64
+            )
+            sent_mean_idg_scores = mean_idg_scores[current_pos : current_pos + k].to(
+                "cpu", dtype=torch.float64
+            )
+            sent_shap_iq_scores = shap_iq_scores[current_pos : current_pos + k].to(
+                "cpu", dtype=torch.float64
+            )
 
-            batch_results.extend(entity_pairs_scores)
+            sent_eigenvectors = entity_eigenvectors[
+                3 * current_pos : 3 * (current_pos + k)
+            ].to("cpu", dtype=torch.float64)
+            e_i_eigenvectors = sent_eigenvectors[::3]
+            e_j_eigenvectors = sent_eigenvectors[1::3]
+
+            sent_entity_separators = dependent_entity_separators[
+                3 * current_pos : 3 * (current_pos + k)
+            ].to("cpu", dtype=torch.int32)
+            e_i_entity_separators = sent_entity_separators[::3]
+            e_j_entity_separators = sent_entity_separators[1::3]
+            mask_separators = sent_entity_separators[2::3]
+
+            sent_cond_probas_i = cond_probas_i[current_pos : current_pos + k].to(
+                "cpu", dtype=torch.float64
+            )
+            sent_cond_probas_j = cond_probas_j[current_pos : current_pos + k].to(
+                "cpu", dtype=torch.float64
+            )
+            sent_mask_probas = mask_probas[current_pos : current_pos + k].to(
+                "cpu", dtype=torch.float64
+            )
+
+            sent_pdets = pdets[3 * current_pos : 3 * (current_pos + k)].to(
+                "cpu", dtype=torch.float64
+            )
+            e_i_pdets = sent_pdets[::3]
+            e_j_pdets = sent_pdets[1::3]
+            sent_traces = traces[3 * current_pos : 3 * (current_pos + k)].to(
+                "cpu", dtype=torch.float64
+            )
+            e_i_traces = sent_traces[::3]
+            e_j_traces = sent_traces[1::3]
+            sent_radii = radii[3 * current_pos : 3 * (current_pos + k)].to(
+                "cpu", dtype=torch.float64
+            )
+            e_i_radii = sent_radii[::3]
+            e_j_radii = sent_radii[1::3]
+
+            for j, span_combo in enumerate(sent_span_combinations):
+                batch_results.append(
+                    {
+                        "pos_or_neg": sent_label,
+                        "e_i_idx": list(span_combo[0]),
+                        "e_j_idx": list(span_combo[1]),
+                        "e_i_tokens": " ".join(
+                            sent_tokens[span_combo[0][0] : span_combo[0][1]]
+                        ),
+                        "e_j_tokens": " ".join(
+                            sent_tokens[span_combo[1][0] : span_combo[1][1]]
+                        ),
+                        "score_mean": sent_mi[j].item(),
+                        "score_frob": sent_mi_frob[j].item(),
+                        "score_andin_orout": sent_smits_andin_orout[j].item(),
+                        "score_andout_orin": sent_smits_andout_orin[j].item(),
+                        "pointwise_baseline": sent_pointwise_mi[j].item(),
+                        "mean_idg_baseline": sent_mean_idg_scores[j].item()
+                        if with_baselines
+                        else -1.0,
+                        "shap_iq_baseline": sent_shap_iq_scores[j].item()
+                        if with_baselines
+                        else -1.0,
+                        "original_text": text,
+                        "doc_number": doc_number,
+                        "e_i_embeddings": sent_embeddings[
+                            span_combo[0][0] : span_combo[0][1]
+                        ],
+                        "e_j_embeddings": sent_embeddings[
+                            span_combo[1][0] : span_combo[1][1]
+                        ],
+                        "e_i_eigenvectors": e_i_eigenvectors[j][
+                            : e_i_entity_separators[j][0]
+                        ],
+                        "e_j_eigenvectors": e_j_eigenvectors[j][
+                            e_j_entity_separators[j][0] :
+                        ],
+                        "e_i_probas_joint": sent_cond_probas_i[j][
+                            : e_i_entity_separators[j][0]
+                        ],
+                        "e_j_probas_joint": sent_cond_probas_j[j][
+                            : e_j_entity_separators[j][0]
+                        ],
+                        "e_i_probas_prod": sent_mask_probas[j][: mask_separators[j][0]],
+                        "e_j_probas_prod": sent_mask_probas[j][mask_separators[j][0] :],
+                        "e_i_pdets": e_i_pdets[j][: e_i_entity_separators[j][0]],
+                        "e_j_pdets": e_j_pdets[j][e_j_entity_separators[j][0] :],
+                        "e_i_traces": e_i_traces[j][: e_i_entity_separators[j][0]],
+                        "e_j_traces": e_j_traces[j][e_j_entity_separators[j][0] :],
+                        "e_i_radii": e_i_radii[j][: e_i_entity_separators[j][0]],
+                        "e_j_radii": e_j_radii[j][e_j_entity_separators[j][0] :],
+                    }
+                )
             current_pos += k
 
         return batch_results

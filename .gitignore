@@ -223,5 +223,3 @@ __marimo__/
 *.pkl.tar.zip
 *.out
 slurm*
-
-circuit-tracer/

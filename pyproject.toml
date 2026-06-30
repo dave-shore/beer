@@ -8,7 +8,6 @@ authors = [
 readme = "README.md"
 requires-python = ">=3.12,<3.15"
 dependencies = [
-    "transformers (>=4.57.1,<5.0.0)",
     "datasets (>=4.4.1,<5.0.0)",
     "wandb (>=0.23.0,<0.24.0)",
     "scikit-learn (>=1.7.2,<2.0.0)",
@@ -16,6 +15,12 @@ dependencies = [
     "shapiq (>=1.4.1,<2.0.0)",
     "mbrs (>=0.1.8,<0.2.0)",
     "pot (>=0.9.6.post1,<0.10.0)",
+    "peft (==0.17.1)",
+    "transformers (==4.49)",
+    "setuptools (==80.10.2)",
+    "tensordict (>=0.6.0,<1.0.0)",
+    "sentence-transformers (>=5.6.0,<6.0.0)",
+    "stanza (>=1.12.2,<2.0.0)",
 ]
 
 [tool.poetry]
