@@ -4,6 +4,7 @@ import argparse
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
+from datetime import datetime
 import gc
 import itertools
 from itertools import chain, combinations
@@ -12,7 +13,7 @@ import json
 import math
 import os
 import re
-from typing import List, Tuple, Dict, Set
+from typing import List, Tuple, Dict, Set, Callable
 import warnings
 
 from datasets import load_dataset
@@ -146,39 +147,22 @@ def pad_traces_and_eigenvectors(L: List[torch.Tensor]) -> torch.Tensor:
     padding_shape = tuple(max(along_dim) for along_dim in zip(*shapes))
 
     for i, T in enumerate(L):
-        if i % 3:
-            # For pairs (j,i), with i < j, we pad the left side of the output dim (dim 1) and the right side of the input dim (dim 2)
-            left_padding = tuple(
-                chain.from_iterable(
-                    [
-                        [padding_shape[j] - T.shape[j], 0]
-                        if j % 2
-                        else [0, padding_shape[j] - T.shape[j]]
-                        for j in range(len(T.shape))
-                    ][::-1]
-                )
+        # Right-pad every row (entity i, entity j and pair rows alike) on
+        # every axis. The previous `i % 3` branching left-padded the j/pair
+        # rows on alternating axes -- including the embedding axis, which
+        # shifted embedding coordinates -- while all downstream consumers
+        # (head slices like `[:sep]` and leading-index truncations) assume the
+        # real data starts at index 0. Cast to float32 so the spectra keep
+        # their precision even when the default dtype is float16.
+        right_padding = tuple(
+            chain.from_iterable(
+                [
+                    [0, padding_shape[j] - T.shape[j]]
+                    for j in range(len(T.shape))
+                ][::-1]
             )
-            T = torch.nn.functional.pad(T, left_padding).to(
-                dtype=torch.get_default_dtype()
-            )
-        else:
-            # For pairs (j,i), with i > j, we pad the right side of the output dim (dim 1) and the left side of the input dim (dim 2)
-            right_padding = tuple(
-                chain.from_iterable(
-                    [
-                        [0, padding_shape[j] - T.shape[j]]
-                        if j % 2
-                        else [padding_shape[j] - T.shape[j], 0]
-                        for j in range(len(T.shape))
-                    ][::-1]
-                )
-            )
-            T = torch.nn.functional.pad(T, right_padding).to(
-                dtype=torch.get_default_dtype()
-            )
-
-        # For tensors that combine two entities it doesn't matter, we treat them as left-padded
-        L[i] = T
+        )
+        L[i] = torch.nn.functional.pad(T, right_padding).to(dtype=torch.float32)
 
     # `torch.stack` (not `torch.cat`) so the per-element dimension becomes a new
     # leading axis. Using `cat` here folded the combination/token axis into dim 0
@@ -530,10 +514,10 @@ def forward_backward_pass(
     tokenizer: AutoTokenizer,
     mlm_model: AutoModelForMaskedLM,
     gold_spans: List[List[Tuple[int, int]]] = None,
-    min_num_eigenvectors: int = 32,
+    min_num_eigenvectors: int = 16,
     max_num_eigenvectors: int = None,
-    max_tokens_per_entity: int = 5,
-    max_retained_vocab: int = 50,
+    max_tokens_per_entity: int = 4,
+    max_retained_vocab: int = 32,
     minibatch_size: int = 3,
     encoder_name: str = "encoder",
     insert_negative_samples: bool = False,
@@ -570,9 +554,11 @@ def forward_backward_pass(
     attn_mask = encoded_inputs.attention_mask
     row_lens = attn_mask.sum(dim=1).to(dtype=torch.int32)
     num_labels = len(pred_to_mask) if pred_to_mask else 2
-    # Threshold from power of Chi-Squared test for uniformity of distribution
+    # Threshold from power of Chi-Squared test for uniformity of distribution.
+    # `isf(0.05)` is the 95% critical value; the previous `isf(0.95)` read the
+    # 5th percentile, i.e. the wrong tail.
     probit_threshold = 1 / num_labels + math.sqrt(
-        chi2.isf(0.95, num_labels - 1) / (2 * num_labels)
+        chi2.isf(0.05, num_labels - 1) / (2 * num_labels)
     )
     probit_threshold = min(probit_threshold, 0.5)
 
@@ -597,9 +583,14 @@ def forward_backward_pass(
     # If gold spans are provided, we need to remove any found spans that overlap with the gold spans and insert the gold spans in place of the found spans
     if gold_spans is not None:
         new_spans = []
+        sanitized_gold_spans = []
         for found_span_list, gold_span_list in zip(ent_spans, gold_spans):
-            if len(gold_span_list) == 1:
-                gold_span_list.pop(0)
+            # Work on a copy: the gold-span lists come straight from the
+            # dataframe rows and must not be mutated across batches/reruns.
+            # A single gold span cannot form a gold pair, so treat the
+            # document as having no usable gold annotation.
+            gold_span_list = [] if len(gold_span_list) == 1 else list(gold_span_list)
+            sanitized_gold_spans.append(gold_span_list)
 
             filtered_span_list = [
                 found
@@ -616,6 +607,7 @@ def forward_backward_pass(
                 new_spans.append([])
 
         ent_spans = new_spans
+        gold_spans = sanitized_gold_spans
 
     else:
         gold_spans = [[] for _ in ent_spans]
@@ -953,10 +945,60 @@ def forward_backward_pass(
                 dim=-2,
             )
 
+        embedding_layer = (
+            output_only_model.model.base_model.embeddings
+            if hasattr(output_only_model.model.base_model, "embeddings")
+            else output_only_model.model.base_model.embed_tokens
+        )
+        # Embed a full sequence of mask tokens so that the mask baseline at
+        # each position carries the same positional/type components as the
+        # input embeddings at that position; embedding a lone mask token at
+        # position 0 (previous behaviour) made the distances mostly measure
+        # positional-embedding differences.
+        mask_row = torch.full(
+            (1, input_embeddings.shape[1]),
+            mask_tok_id,
+            dtype=torch.long,
+            device=output_only_model.device,
+        )
+        mask_embedding_per_position = embedding_layer(mask_row)[0].to(
+            "cpu", dtype=input_embeddings.dtype
+        )
+        # Use the *minibatch* pred ids (the previous code zipped the minibatch
+        # embeddings against the full-batch `pred_ids`, so every minibatch
+        # reused the spans of the first rows of the whole batch). Entity i is
+        # masked in row 0 of each triplet but visible in row 1 (where entity j
+        # is masked) and vice versa: measure each entity's distance to the
+        # mask baseline from the row where it is visible, otherwise the
+        # distance is mask-vs-mask and carries no signal about the entity.
+        input_embeddings_cpu = input_embeddings.detach().cpu()
+        embedding_distances_to_mask = []
+        for t in range(0, input_embeddings_cpu.shape[0], 3):
+            ids_i = torch.as_tensor(minibatch_pred_ids[t], dtype=torch.long)
+            ids_j = torch.as_tensor(minibatch_pred_ids[t + 1], dtype=torch.long)
+            ids_pair = torch.as_tensor(minibatch_pred_ids[t + 2], dtype=torch.long)
+            dist_i = (
+                input_embeddings_cpu[t + 1][ids_i]
+                - mask_embedding_per_position[ids_i]
+            ).norm(dim=-1)
+            dist_j = (
+                input_embeddings_cpu[t][ids_j] - mask_embedding_per_position[ids_j]
+            ).norm(dim=-1)
+            # Both entities are masked in the pair row; this slot only keeps
+            # the 3-per-triplet layout and is not used downstream.
+            dist_pair = (
+                input_embeddings_cpu[t][ids_pair]
+                - mask_embedding_per_position[ids_pair]
+            ).norm(dim=-1)
+            embedding_distances_to_mask.extend([dist_i, dist_j, dist_pair])
+
         final_outputs["pdets"].extend([T for T in pullback_pdets.cpu()])
         final_outputs["traces"].extend([T for T in pullback_traces.cpu()])
         final_outputs["radii"].extend([T for T in pullback_radii.cpu()])
         final_outputs["eigenvectors"].extend([T for T in diverging_eigenvectors.cpu()])
+        final_outputs["embedding_distances_to_mask"].extend(
+            embedding_distances_to_mask
+        )
         final_outputs["pred_probas"].extend([T for T in predictions.cpu()])
 
         del (
@@ -1081,6 +1123,11 @@ def arnold_gokhale_denominator(
     return Z, P_joints
 
 
+def or_operation(x: torch.Tensor, dim: int = -1, p_minkowski: float = 2):
+
+    return x.pow(p_minkowski).nanmean(dim=dim).pow(1 / p_minkowski)
+
+
 def and_operation(x: torch.Tensor, dim: int = -1, eps_correction: float = 1e-6):
     """Exp-sum-log operation to avoid that too small values become 0 in an approximation of minimum or product."""
 
@@ -1097,16 +1144,7 @@ def and_operation(x: torch.Tensor, dim: int = -1, eps_correction: float = 1e-6):
     output = torch.clamp(output, min=0, max=max_value)
     output = torch.where(mask.sum(dim=dim) > 0, output, torch.zeros_like(output))
 
-    nonfinite_values = (
-        torch.logical_or(torch.isnan(output), torch.isinf(output)).sum().item()
-    )
-    if nonfinite_values > 0:
-        print(
-            f"Warning: {nonfinite_values} non-finite values in and_operation. Turning them into 0."
-        )
-        output = torch.where(torch.isfinite(output), output, torch.zeros_like(output))
-
-    return output
+    return output.nan_to_num(nan = 0.0, posinf = max_value, neginf = 0.0)
 
 
 @torch.no_grad()
@@ -1119,7 +1157,9 @@ def compute_mutual_information(
     cond_probas_j: torch.Tensor,
     mask_probas: torch.Tensor,
     dependent_entity_separators: torch.Tensor,
+    embedding_distances_to_mask: torch.Tensor,
     p_minkowski: float = 2,
+    eta: float = 0.01,
 ):
 
     embedding_size = traces.shape[-1]
@@ -1143,10 +1183,6 @@ def compute_mutual_information(
     dependent_entity_separators_j = dependent_entity_separators[1::3]
     dependent_entity_separators_ij = dependent_entity_separators[2::3]
 
-    cond_probas_i = torch.nn.functional.normalize(cond_probas_i, dim=-1, p=1)
-    cond_probas_j = torch.nn.functional.normalize(cond_probas_j, dim=-1, p=1)
-    mask_probas = torch.nn.functional.normalize(mask_probas, dim=-1, p=1)
-
     cond_predictions_i, cond_pred_indices_i = cond_probas_i.max(dim=-1)
     cond_predictions_j, cond_pred_indices_j = cond_probas_j.max(dim=-1)
     mask_predictions, mask_pred_indices = mask_probas.max(dim=-1)
@@ -1162,10 +1198,10 @@ def compute_mutual_information(
         .expand(mask_predictions.shape[0], -1)
     )
     mask_Pi_num = torch.where(
-        positions_of_predictions < dependent_entity_separators_i[:, 0], 1, 0
+        cond_predictions_i > EPS, 1, 0
     ).unsqueeze(-1)
     mask_Pj_num = torch.where(
-        positions_of_predictions < dependent_entity_separators_j[:, 1], 1, 0
+        cond_predictions_j > EPS, 1, 0
     ).unsqueeze(-1)
 
     mask_Pi_den = torch.where(
@@ -1185,18 +1221,18 @@ def compute_mutual_information(
     vocab_Pj = cond_probas_j * mask_Pj_num[:, : cond_probas_j.shape[1], :]
     num_Pi = (
         cond_predictions_i.unsqueeze(-1)
-        * mask_Pi_num[:, : cond_predictions_i.shape[1], :]
+        * mask_Pi_num
     )
     num_Pj = (
         cond_predictions_j.unsqueeze(-1)
-        * mask_Pj_num[:, : cond_predictions_j.shape[1], :]
+        * mask_Pj_num
     )
     num_Pj = num_Pj.transpose(-2, -1)
     den_Pi = (
-        mask_predictions.unsqueeze(-1) * mask_Pi_den[:, : mask_predictions.shape[1], :]
+        mask_predictions.unsqueeze(-1) * mask_Pi_den
     )
     den_Pj = (
-        mask_predictions.unsqueeze(-1) * mask_Pj_den[:, : mask_predictions.shape[1], :]
+        mask_predictions.unsqueeze(-1) * mask_Pj_den
     )
     den_Pj = den_Pj.transpose(-2, -1)
     max_P_shape = max(
@@ -1224,92 +1260,54 @@ def compute_mutual_information(
     alpha_j = (1 - num_Pj / (num_Pi + EPS)) / (Zs + EPS)
     # alpha.shape = (N_combinations, max_len_entities, max_len_entities)
 
-    internal_log = torch.log(
-        (alpha_i * den_Pi + alpha_j * den_Pj + EPS) / (den_Pi**2 + den_Pj**2 + EPS)
+    I_embedding_distances_to_mask = embedding_distances_to_mask[::3]
+    J_embedding_distances_to_mask = embedding_distances_to_mask[1::3]
+    # Distances are per entity token: (N, len_i, 1) for entity i and
+    # (N, len_j, 1) for entity j. Pad only the token axis and let the tensors
+    # broadcast across the other entity's axis (entity i varies along dim -2,
+    # entity j along dim -1). The previous padding filled the broadcast axis
+    # with zeros, silently zeroing every column of Ci/Cj except the first.
+    I_embedding_distances_to_mask = torch.nn.functional.pad(
+        I_embedding_distances_to_mask,
+        (0, 0, 0, max_P_shape - I_embedding_distances_to_mask.shape[1]),
+        value=0,
     )
-    internal_term_j = num_Pi - den_Pi
-    internal_term_i = num_Pj - den_Pj
-    Ci = alpha_j**2 * ((internal_log + internal_term_i) ** 2 - 1) / (Zs**2 + EPS)
-    Cj = alpha_i**2 * ((internal_log + internal_term_j) ** 2 - 1) / (Zs**2 + EPS)
+    J_embedding_distances_to_mask = torch.nn.functional.pad(
+        J_embedding_distances_to_mask,
+        (0, 0, 0, max_P_shape - J_embedding_distances_to_mask.shape[1]),
+        value=0,
+    ).transpose(-2, -1)
 
+    log_numerator = alpha_i * den_Pi + alpha_j * den_Pj
+    internal_log = torch.log(
+        log_numerator / (den_Pi**2 + den_Pj**2 + EPS)
+    )
+    #internal_term_j = (den_Pi*num_Pi**2 - den_Pj*num_Pj**2) / (log_numerator + EPS)
+    #internal_term_i = (den_Pj*num_Pj**2 - den_Pi*num_Pi**2) / (log_numerator + EPS)
+    P_min = torch.min(
+        torch.stack([
+            num_Pi.transpose(-2, -1), 
+            num_Pj, 
+            den_Pi.transpose(-2,-1), 
+            den_Pj
+        ], dim=-1), dim=-1).values
+    #eta = torch.where(torch.logical_and(P_min > 0, P_min < eta), P_min, eta)
+    Ci = alpha_i * I_embedding_distances_to_mask / (Zs + EPS) * (2 + internal_log) # + eta*internal_term_i)
+    Cj = alpha_j * J_embedding_distances_to_mask / (Zs + EPS) * (2 + internal_log) # + eta*internal_term_j)
     # C*.shape = (N_combinations, max_len_entities, max_len_entities)
 
-    # traces/radii/pdets are stored 3-per-combination in the triplet layout
-    # [I|J, J|I, J|I_dup] (see `pullback`). The I-geometry (I|J) lives at
-    # stride-3 offset 0 and the J-geometry (J|I) at offset 1 -- matching how
-    # `dependent_entity_separators` and the predictions are sliced
-    # (`[::3]`, `[1::3]`, `[2::3]`). The previous stride-2 (`[::2]`/`[1::2]`)
-    # silently misaligned I/J rows (and only worked by accident via the
-    # `take_along_dim` truncation below).
-    I_stretch = radii[::3] / traces[::3]
-    J_stretch = radii[1::3] / traces[1::3]
-    I_stretch = torch.where(
-        torch.isfinite(I_stretch), I_stretch, torch.ones_like(I_stretch)
-    )
-    J_stretch = torch.where(
-        torch.isfinite(J_stretch), J_stretch, torch.ones_like(J_stretch)
-    )
-
+    I_radii = radii[::3]
+    J_radii = radii[1::3]
     pdets_i = pdets[::3]
     pdets_j = pdets[1::3]
-
-    for i, (s1, s2) in enumerate(zip(Ci.shape, I_stretch.shape)):
-        if s1 < s2:
-            I_stretch = torch.take_along_dim(
-                I_stretch,
-                indices=torch.arange(s1, device=I_stretch.device).reshape(
-                    *[1 if j != i else -1 for j in range(I_stretch.dim())]
-                ),
-                dim=i,
-            )
-            pdets_i = torch.take_along_dim(
-                pdets_i,
-                indices=torch.arange(s1, device=pdets_i.device).reshape(
-                    *[1 if j != i else -1 for j in range(pdets_i.dim())]
-                ),
-                dim=i,
-            )
-        elif s1 > s2:
-            Ci = torch.take_along_dim(
-                Ci,
-                indices=torch.arange(s2, device=Ci.device).reshape(
-                    *[1 if j != i else -1 for j in range(Ci.dim())]
-                ),
-                dim=i,
-            )
-
-    for i, (s1, s2) in enumerate(zip(Cj.shape, J_stretch.shape)):
-        if s1 < s2:
-            J_stretch = torch.take_along_dim(
-                J_stretch,
-                indices=torch.arange(s1, device=J_stretch.device).reshape(
-                    *[1 if j != i else -1 for j in range(J_stretch.dim())]
-                ),
-                dim=i,
-            )
-            pdets_j = torch.take_along_dim(
-                pdets_j,
-                indices=torch.arange(s1, device=pdets_j.device).reshape(
-                    *[1 if j != i else -1 for j in range(pdets_j.dim())]
-                ),
-                dim=i,
-            )
-        elif s1 > s2:
-            Cj = torch.take_along_dim(
-                Cj,
-                indices=torch.arange(s2, device=Cj.device).reshape(
-                    *[1 if j != i else -1 for j in range(Cj.dim())]
-                ),
-                dim=i,
-            )
 
     pad_mask = torch.logical_and(
         num_Pi.expand(-1, -1, max_P_shape) > 0,
         num_Pj.expand(-1, max_P_shape, -1) > 0,
     )
 
-    I_term = Ci * torch.sqrt(pdets_i * I_stretch)
-    J_term = Cj * torch.sqrt(pdets_j * J_stretch)
+    I_term = torch.sqrt(pdets_i * I_radii * Ci**2)
+    J_term = torch.sqrt(pdets_j * J_radii * Cj**2)
     I_term = torch.where(pad_mask, I_term, torch.zeros_like(I_term))
     J_term = torch.where(pad_mask, J_term, torch.zeros_like(J_term))
 
@@ -1322,38 +1320,38 @@ def compute_mutual_information(
         torch.count_nonzero(J_term_flat, dim=-1) + EPS
     )
     I_term_frob = (
-        (I_term_flat / (torch.count_nonzero(I_term_flat, dim=-1) + EPS).unsqueeze(-1))
-        .pow(2)
+        (I_term_flat ** 2 / (torch.count_nonzero(I_term_flat, dim=-1) + EPS).unsqueeze(-1))
         .nansum(dim=-1)
         .sqrt()
     )
     J_term_frob = (
-        (J_term_flat / (torch.count_nonzero(J_term_flat, dim=-1) + EPS).unsqueeze(-1))
-        .pow(2)
+        (J_term_flat ** 2 / (torch.count_nonzero(J_term_flat, dim=-1) + EPS).unsqueeze(-1))
         .nansum(dim=-1)
         .sqrt()
     )
+
+    # I terms are ordered as (out,in) and J terms as (in,out)
     I_term_andin_orout = and_operation(
-        I_term.pow(p_minkowski).nanmean(dim=-2).pow(1 / p_minkowski), dim=-1
+        or_operation(I_term, dim=-2), dim=-1
     )
     J_term_andin_orout = and_operation(
-        J_term.pow(p_minkowski).nanmean(dim=-1).pow(1 / p_minkowski), dim=-1
+        or_operation(J_term, dim=-1), dim=-1
     )
     I_term_andout_orin = and_operation(
-        I_term.pow(p_minkowski).nanmean(dim=-1).pow(1 / p_minkowski), dim=-1
+        or_operation(I_term, dim=-1), dim=-1
     )
     J_term_andout_orin = and_operation(
-        J_term.pow(p_minkowski).nanmean(dim=-2).pow(1 / p_minkowski), dim=-1
+        or_operation(J_term, dim=-2), dim=-1
     )
 
-    smits_mean = 2 * math.sqrt(embedding_size * 2) * (I_term_mean + J_term_mean)
-    smits_frob = 2 * math.sqrt(embedding_size * 2) * (I_term_frob + J_term_frob)
+    smits_mean = (I_term_mean + J_term_mean)/2
+    smits_frob = (I_term_frob + J_term_frob)/2
     smits_andin_orout = (
-        2 * math.sqrt(embedding_size * 2) * (I_term_andin_orout + J_term_andin_orout)
-    )
+        I_term_andin_orout + J_term_andin_orout
+    )/2
     smits_andout_orin = (
-        2 * math.sqrt(embedding_size * 2) * (I_term_andout_orin + J_term_andout_orin)
-    )
+        I_term_andout_orin + J_term_andout_orin
+    )/2
     pointwise_mi = (
         torch.log((P_joints + EPS) / (den_Pi * den_Pj.transpose(-2, -1) + EPS))
         .flatten(start_dim=1)
@@ -1413,6 +1411,11 @@ def get_combination_indices_with_repeats(lists, num_indices_per_doc=None):
 
 @timing_decorator
 def main(
+    dataset_name: str = "xiaobendanyn/tacred",
+    get_text: Callable = lambda x: x["token"],
+    get_heads: Callable = lambda x: x["h"],
+    get_tails: Callable = lambda x: x["t"],
+    get_relations: Callable = lambda x: x["relation"],
     test: bool = False,
     model_name: str = None,
     with_mbrd: bool = False,
@@ -1422,13 +1425,15 @@ def main(
 ):
 
     print(f"Scoring model: {model_name}")
+    dataset_short_name = dataset_name.split("/")[-1]
+    model_short_name = model_name.split("/")[-1]
     if devices is not None:
         train_device = torch.device(devices[0])
     else:
         train_device = _resolve_torch_device(None)
 
-    training_data = load_dataset("xiaobendanyn/tacred", split="train")
-    data = load_dataset("xiaobendanyn/tacred", split="test")
+    training_data = load_dataset(dataset_name, split="train") #DFKI-SLT/nyt-multi, xiaobendanyn/tacred
+    data = load_dataset(dataset_name, split="test")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     if "distilbert" in model_name.lower():
@@ -1450,7 +1455,7 @@ def main(
             if isinstance(x, list)
             else x
         )
-    )
+    ) if dataset_name == "xiaobendanyn/tacred" else training_data.to_pandas()
     df = pd.DataFrame([json.loads(d["text"]) for d in data]).map(
         lambda x: (
             x["name"]
@@ -1459,8 +1464,20 @@ def main(
             if isinstance(x, list)
             else x
         )
-    )
-    df.rename(columns={"token": "input", "relation": "label"}, inplace=True)
+    ) if dataset_name == "xiaobendanyn/tacred" else data.to_pandas()
+
+    df["input"] = df.apply(get_text, axis=1)
+    df["h"] = df.apply(get_heads, axis=1)
+    df["t"] = df.apply(get_tails, axis=1)
+    df["label"] = df.apply(get_relations, axis=1)
+    if df[['h','t','label']].apply(lambda x: x.apply(lambda y: isinstance(y, list) and len(y) > 1).any(), axis=1).any():
+        df = df.explode(['h','t','label'])
+    train_df["input"] = train_df.apply(get_text, axis=1)
+    train_df["h"] = train_df.apply(get_heads, axis=1)
+    train_df["t"] = train_df.apply(get_tails, axis=1)
+    train_df["label"] = train_df.apply(get_relations, axis=1)
+    if train_df[['h','t','label']].apply(lambda x: x.apply(lambda y: isinstance(y, list) and len(y) > 1).any(), axis=1).any():
+        train_df = train_df.explode(['h','t','label'])
 
     # Tokenize every sentence once and reuse the BatchEncoding's char_to_token
     # mapping, instead of re-tokenizing per row (and per query).
@@ -1494,15 +1511,15 @@ def main(
     print("Model loaded", flush=True)
     batch_size = 12
     max_num_eigenvectors = (
-        model.config.embedding_size // 2
+        model.config.embedding_size // 4
         if hasattr(model.config, "embedding_size")
-        else model.config.hidden_size // 2
+        else model.config.hidden_size // 4
     )
-    max_retained_vocab = 50
+    max_retained_vocab = 32
     os.makedirs("../results", exist_ok=True)
 
     if test:
-        df = df.sample(16)
+        df = df.sample(10)
 
     df.reset_index(inplace=True)
     ex = [row for _, row in df.iterrows()]
@@ -1583,6 +1600,8 @@ def main(
             pos_or_neg = ["pos"] * (len(valid_document_numbers) // 2) + ["neg"] * (
                 len(valid_document_numbers) // 2
             )
+        else:
+            pos_or_neg = ["pos"] * len(valid_document_numbers)
 
         if any(
             res is None
@@ -1652,6 +1671,7 @@ def main(
             pullback_dict["cond_probas_j"],
             pullback_dict["mask_probas"],
             dependent_entity_separators,
+            pullback_dict["embedding_distances_to_mask"],
         )
 
         mi = mi_dict["smits_mean"].detach().cpu()  # shape = (total_combinations,)
@@ -1667,8 +1687,17 @@ def main(
         )  # shape = (total_combinations,)
 
         entity_eigenvectors = pullback_dict.pop("eigenvectors").detach().cpu()
-        # shape = (3*total_combinations, max_len, max_pred_ids, num_eigenvectors, embedding_size)
+        # shape = (3*total_combinations, max_pred_ids, max_eq_class_ids, num_eigenvectors, embedding_size)
         # i.e. 3-per-combination triplets [I|J, J|I, J|I_dup], indexed at 3*(current_pos+j) below.
+        # Collapse the perturbed-position axis (dim 2) with a masked mean so that
+        # each predicted entity token keeps a single
+        # (num_eigenvectors, embedding_size) eigenbasis; zero-padded slots are
+        # excluded from the average.
+        _valid_slots = entity_eigenvectors.abs().sum(dim=(-2, -1), keepdim=True) > 0
+        entity_eigenvectors = entity_eigenvectors.sum(dim=2) / _valid_slots.sum(
+            dim=2
+        ).clamp(min=1)
+        # shape = (3*total_combinations, max_pred_ids, num_eigenvectors, embedding_size)
         radii = (
             pullback_dict.pop("radii")
             .detach()
@@ -1722,24 +1751,30 @@ def main(
                 filtered_batch,
                 tokenizer,
                 entity_span_combinations,
+                # Match the sampling cap used by `forward_backward_pass` so the
+                # baseline scores the same token positions as the SMITS path.
+                max_tokens_per_entity=4,
                 M=9,
                 encoder_name=encoder_name,
             )
-            shap_iq_scores_single = [
-                tup[0]
-                for tup in shapley_interaction_quantification(
-                    mlm_use,
-                    filtered_batch,
-                    tokenizer,
-                    entity_spans,
-                    encoder_name=encoder_name,
-                )
-            ]
+            # `shapley_interaction_quantification` yields one
+            # (n_players, n_players) matrix of order-2 interaction values per
+            # sentence, with players indexed in the same sorted-span order used
+            # to build `entity_span_combinations`. The score of the pair
+            # (i, j) is the interaction value at [i, j]; the previous
+            # `(row0[i] + row0[j]) / 2` read player 0's interactions with i
+            # and j instead of the (i, j) interaction.
             shap_iq_scores = torch.as_tensor(
                 [
-                    (single_scores[i] + single_scores[j]) / 2
-                    for single_scores in shap_iq_scores_single
-                    for i, j in combinations(range(len(single_scores)), 2)
+                    float(matrix[i, j])
+                    for matrix in shapley_interaction_quantification(
+                        mlm_use,
+                        filtered_batch,
+                        tokenizer,
+                        entity_spans,
+                        encoder_name=encoder_name,
+                    )
+                    for i, j in combinations(range(matrix.shape[0]), 2)
                 ]
             )
 
@@ -1750,7 +1785,7 @@ def main(
         batch_results = []
         retokenized_batch = tokenizer(
             filtered_batch,
-            padding="max_length",
+            padding=True,
             add_special_tokens=False,
             max_length=model.config.max_position_embeddings - 2
             if hasattr(model.config, "max_position_embeddings")
@@ -1779,32 +1814,40 @@ def main(
 
             sent_tokens = batch_token_lists[i]
             text = filtered_batch[i]
-            sent_embeddings = entity_embeddings[i].to("cpu", dtype=torch.float64)
+            sent_embeddings = entity_embeddings[i].to("cpu", dtype=torch.float32)
             doc_number = valid_document_numbers[i]
             sent_label = pos_or_neg[i]
-            sent_mi = mi[current_pos : current_pos + k].to("cpu", dtype=torch.float64)
+            sent_mi = mi[current_pos : current_pos + k].to("cpu", dtype=torch.float32)
             sent_mi_frob = mi_frob[current_pos : current_pos + k].to(
-                "cpu", dtype=torch.float64
+                "cpu", dtype=torch.float32
             )
             sent_smits_andin_orout = smits_andin_orout[
                 current_pos : current_pos + k
-            ].to("cpu", dtype=torch.float64)
+            ].to("cpu", dtype=torch.float32)
             sent_smits_andout_orin = smits_andout_orin[
                 current_pos : current_pos + k
-            ].to("cpu", dtype=torch.float64)
+            ].to("cpu", dtype=torch.float32)
             sent_pointwise_mi = pointwise_mi[current_pos : current_pos + k].to(
-                "cpu", dtype=torch.float64
+                "cpu", dtype=torch.float32
             )
-            sent_mean_idg_scores = mean_idg_scores[current_pos : current_pos + k].to(
-                "cpu", dtype=torch.float64
+            sent_mean_idg_scores = (
+                mean_idg_scores[current_pos : current_pos + k].to(
+                    "cpu", dtype=torch.float32
+                )
+                if with_baselines
+                else None
             )
-            sent_shap_iq_scores = shap_iq_scores[current_pos : current_pos + k].to(
-                "cpu", dtype=torch.float64
+            sent_shap_iq_scores = (
+                shap_iq_scores[current_pos : current_pos + k].to(
+                    "cpu", dtype=torch.float32
+                )
+                if with_baselines
+                else None
             )
 
             sent_eigenvectors = entity_eigenvectors[
                 3 * current_pos : 3 * (current_pos + k)
-            ].to("cpu", dtype=torch.float64)
+            ].to("cpu", dtype=torch.float32)
             e_i_eigenvectors = sent_eigenvectors[::3]
             e_j_eigenvectors = sent_eigenvectors[1::3]
 
@@ -1816,27 +1859,27 @@ def main(
             mask_separators = sent_entity_separators[2::3]
 
             sent_cond_probas_i = cond_probas_i[current_pos : current_pos + k].to(
-                "cpu", dtype=torch.float64
+                "cpu", dtype=torch.float32
             )
             sent_cond_probas_j = cond_probas_j[current_pos : current_pos + k].to(
-                "cpu", dtype=torch.float64
+                "cpu", dtype=torch.float32
             )
             sent_mask_probas = mask_probas[current_pos : current_pos + k].to(
-                "cpu", dtype=torch.float64
+                "cpu", dtype=torch.float32
             )
 
             sent_pdets = pdets[3 * current_pos : 3 * (current_pos + k)].to(
-                "cpu", dtype=torch.float64
+                "cpu", dtype=torch.float32
             )
             e_i_pdets = sent_pdets[::3]
             e_j_pdets = sent_pdets[1::3]
             sent_traces = traces[3 * current_pos : 3 * (current_pos + k)].to(
-                "cpu", dtype=torch.float64
+                "cpu", dtype=torch.float32
             )
             e_i_traces = sent_traces[::3]
             e_j_traces = sent_traces[1::3]
             sent_radii = radii[3 * current_pos : 3 * (current_pos + k)].to(
-                "cpu", dtype=torch.float64
+                "cpu", dtype=torch.float32
             )
             e_i_radii = sent_radii[::3]
             e_j_radii = sent_radii[1::3]
@@ -1875,8 +1918,13 @@ def main(
                         "e_i_eigenvectors": e_i_eigenvectors[j][
                             : e_i_entity_separators[j][0]
                         ],
+                        # For the single-entity rows (1::3) the predicted
+                        # positions are entity j's own tokens starting at row 0
+                        # (unlike the pair rows, where entity j follows entity
+                        # i), so slice [:sep] exactly like e_i. This keeps the
+                        # token axis aligned with e_j_embeddings.
                         "e_j_eigenvectors": e_j_eigenvectors[j][
-                            e_j_entity_separators[j][0] :
+                            : e_j_entity_separators[j][0]
                         ],
                         "e_i_probas_joint": sent_cond_probas_i[j][
                             : e_i_entity_separators[j][0]
@@ -1887,11 +1935,15 @@ def main(
                         "e_i_probas_prod": sent_mask_probas[j][: mask_separators[j][0]],
                         "e_j_probas_prod": sent_mask_probas[j][mask_separators[j][0] :],
                         "e_i_pdets": e_i_pdets[j][: e_i_entity_separators[j][0]],
-                        "e_j_pdets": e_j_pdets[j][e_j_entity_separators[j][0] :],
+                        # Like the eigenvectors above, the single-entity rows
+                        # (1::3) hold entity j's own data starting at row 0 and
+                        # are right-padded, so slice from the head exactly like
+                        # e_i; the previous tail slice `[sep:]` read padding.
+                        "e_j_pdets": e_j_pdets[j][: e_j_entity_separators[j][0]],
                         "e_i_traces": e_i_traces[j][: e_i_entity_separators[j][0]],
-                        "e_j_traces": e_j_traces[j][e_j_entity_separators[j][0] :],
+                        "e_j_traces": e_j_traces[j][: e_j_entity_separators[j][0]],
                         "e_i_radii": e_i_radii[j][: e_i_entity_separators[j][0]],
-                        "e_j_radii": e_j_radii[j][e_j_entity_separators[j][0] :],
+                        "e_j_radii": e_j_radii[j][: e_j_entity_separators[j][0]],
                     }
                 )
             current_pos += k
@@ -1904,7 +1956,7 @@ def main(
         entity_embeddings: List[List[torch.Tensor]],
         entity_eigenvectors: List[List[torch.Tensor]],
         step_sizes: List[List[float | torch.Tensor]],
-        num_pseudorefs: int = 10,
+        num_pseudorefs: int = 8,
         work_device: torch.device = None,
     ):
         work_device = (
@@ -1914,22 +1966,30 @@ def main(
             torch.cuda.set_device(work_device)
 
         # Each entity embedding is a tensor of size (len_entity, embedding_size)
-        # Each entity eigenvector is a tensor of size (len_entity, embedding_size, num_eigenvectors)
-        # Each entity eigenvalue is a tensor of size (len_entity, num_eigenvectors)
+        # Each entity eigenvector is a tensor of size (len_entity, num_eigenvectors, embedding_size)
 
+        # Keep `num_pseudorefs` eigenvectors along dim -2 (the eigenvector axis);
+        # the embedding axis (dim -1) must stay untouched. Eigenvectors are
+        # sorted by decreasing eigenvalue, so take the leading ones and zero-pad
+        # along dim -2 when fewer are available.
         entity_eigenvectors = [
             [
-                T[..., -num_pseudorefs:]
-                if num_pseudorefs >= T.shape[-1]
-                else torch.nn.functional.pad(T, (0, num_pseudorefs - T.shape[-1]))
+                T[..., :num_pseudorefs, :]
+                if T.shape[-2] >= num_pseudorefs
+                else torch.nn.functional.pad(
+                    T, (0, 0, 0, num_pseudorefs - T.shape[-2])
+                )
                 for T in L
             ]
             for L in entity_eigenvectors
         ]
 
+        # One pseudo-reference per retained eigenvector:
+        # (len_entity, 1, embedding_size) + (len_entity, num_pseudorefs, embedding_size)
+        # -> (len_entity, num_pseudorefs, embedding_size)
         entity_embeddings = [
             [
-                emb.unsqueeze(-1).expand(-1, -1, vec.shape[-1]) + vec * step_size
+                emb.unsqueeze(-2) + vec * step_size
                 for emb, vec, step_size in zip(L1, L2, L3)
             ]
             for L1, L2, L3 in zip(entity_embeddings, entity_eigenvectors, step_sizes)
@@ -1957,7 +2017,7 @@ def main(
                         work_device=work_device,
                         mlm_for_pass=mlm_for_pass,
                         ner_for_pass=ner_for_pass,
-                        gold_spans=gold_spans,
+                        gold_spans=gold_spans[i] if gold_spans is not None else None,
                         doc_indices=doc_indices[i] if doc_indices is not None else None,
                     )
                     for i, batch in enumerate(batch_list)
@@ -1966,6 +2026,32 @@ def main(
         )
 
     #########################################################
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    results_path = f"../results/{dataset_short_name}_scores_{model_short_name}_{timestamp}.json"
+
+    def append_results_to_file(batch_results_to_save: List[Dict]):
+        """Load the results file, append the new batch and re-save it.
+
+        Keeping only the current batch in memory (instead of re-serialising
+        the full accumulated results at every iteration) bounds the peak RAM
+        usage of the saving step. The write goes through a temporary file so
+        a crash mid-write cannot corrupt the results collected so far.
+        """
+        if os.path.exists(results_path):
+            with open(results_path, "r", encoding="utf-8") as f:
+                previous_results = json.load(f)
+        else:
+            previous_results = []
+        previous_results.extend(batch_results_to_save)
+        tmp_path = results_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(previous_results, f)
+        os.replace(tmp_path, results_path)
+        del previous_results
+
+    # Start from a clean file so results from a previous run are not mixed in.
+    n_scored = 0
+
     if devices is not None and len(devices) > 1:
         devices = [torch.device(device) for device in devices]
         batches = list(batch_generator(ex, batch_size))
@@ -1975,99 +2061,110 @@ def main(
         ]
 
         with ThreadPoolExecutor(max_workers=len(devices)) as executor:
+            # Each future receives only its own chunk of batches, and the
+            # arguments follow `score_batch_list`'s signature (the previous
+            # call passed a spurious integer offset as `work_device`, passed
+            # every chunk to every future, and duplicated `mlm_for_pass`).
+            # `doc_indices` carries the dataframe index of each row so that
+            # `doc_number` in the results is always the true document id.
             futures = [
                 executor.submit(
                     score_batch_list,
-                    [[row["input"] for row in batch] for batch in batch_lists],
-                    i * batch_size * list_size,
+                    [[row["input"] for row in batch] for batch in batch_list],
                     devices[i % len(devices)],
-                    mlm_for_pass=mlm_by_device[devices[i % len(devices)]],
-                    ner_for_pass=ner_by_device[devices[i % len(devices)]],
-                    gold_spans=[
-                        [row["gold_spans"] for row in batch] for batch in batch_lists
-                    ],
-                    doc_indices=[
-                        [row["index"] for row in batch] for batch in batch_lists
-                    ],
+                    mlm_by_device[devices[i % len(devices)]],
+                    ner_by_device[devices[i % len(devices)]],
+                    [[row["gold_spans"] for row in batch] for batch in batch_list],
+                    [[row["index"] for row in batch] for batch in batch_list],
                 )
                 for i, batch_list in enumerate(batch_lists)
             ]
 
             for res in as_completed(futures):
-                full_results.extend(res.result())
+                batch_results = res.result()
+                if with_mbrd:
+                    full_results.extend(batch_results)
+                n_scored += len(batch_results)
+                print(f"Processed {n_scored} examples", flush=True)
 
-            print(f"Processed {len(full_results)} examples", flush=True)
-            results_to_save = [
-                {k: v for k, v in d.items() if not isinstance(v, torch.Tensor)}
-                for d in full_results
-            ]
-            with open(
-                f"../results/tacred_scores_{model_name.replace('/', '___')}.json",
-                "w",
-                encoding="utf-8",
-            ) as f:
-                json.dump(results_to_save, f)
+                append_results_to_file(
+                    [
+                        {
+                            k: v
+                            for k, v in d.items()
+                            if not isinstance(v, torch.Tensor)
+                        }
+                        for d in batch_results
+                    ]
+                )
+                del batch_results
+                gc.collect()
     else:
         for i, batch in enumerate(batch_generator(ex, batch_size)):
-            full_results.extend(
-                score_batch(
-                    [row["input"] for row in batch],
-                    work_device=train_device,
-                    mlm_for_pass=mlm_by_device[train_device],
-                    ner_for_pass=ner_by_device[train_device],
-                    gold_spans=[row["gold_spans"] for row in batch],
-                    doc_indices=[row["index"] for row in batch],
-                )
+            batch_results = score_batch(
+                [row["input"] for row in batch],
+                work_device=train_device,
+                mlm_for_pass=mlm_by_device[train_device],
+                ner_for_pass=ner_by_device[train_device],
+                gold_spans=[row["gold_spans"] for row in batch],
+                doc_indices=[row["index"] for row in batch],
             )
-            print(f"Processed {len(full_results)} examples", flush=True)
+            # Only MBR decoding needs the tensor-laden results after this
+            # loop; keeping them otherwise grows RAM unboundedly and gets the
+            # process OOM-killed.
+            if with_mbrd:
+                full_results.extend(batch_results)
+            n_scored += len(batch_results)
+            print(f"Processed {n_scored} examples", flush=True)
 
-            results_to_save = [
+            batch_results_to_save = [
                 {
                     k: v.numpy().tolist() if isinstance(v, torch.Tensor) else v
                     for k, v in d.items()
-                    if k
-                    not in [
-                        "e_i_embeddings",
-                        "e_j_embeddings",
-                        "e_i_eigenvectors",
-                        "e_j_eigenvectors",
-                    ]
                 }
-                for d in full_results
+                for d in batch_results
             ]
-
-            with open(
-                f"../results/tacred_scores_{model_name.replace('/', '___')}.json",
-                "w",
-                encoding="utf-8",
-            ) as f:
-                json.dump(results_to_save, f)
+            append_results_to_file(batch_results_to_save)
+            del batch_results, batch_results_to_save
+            gc.collect()
 
     # MBR DECODING
+    with open(results_path, "r", encoding="utf-8") as f:
+        full_results = json.load(f)
+
+    full_results = sorted(full_results, key=lambda x: x["doc_number"])
+
     full_results_mbrd = []
     if with_mbrd:
+        import numpy as np
+
         hypotheses = df["label"].unique().tolist() + ["no relation"]
+        base_model = getattr(mlm_by_device[train_device], "model", mlm_by_device[train_device])
         relation_disambiguation_model = RelationDisambiguation(
             model_name,
             hypotheses,
             topk=5,
             batch_size=batch_size,
             embedding_module_name="embed_tokens"
-            if hasattr(mlm_by_device[train_device].model.base_model, "embed_tokens")
+            if hasattr(base_model, "embed_tokens")
             else "embeddings",
             encoder_module_name=encoder_name,
             classifier_module_name="lm_head"
-            if hasattr(mlm_by_device[train_device].model.base_model, "lm_head")
+            if hasattr(base_model, "lm_head")
             else "generator_lm_head"
             if hasattr(
-                mlm_by_device[train_device].model.base_model, "generator_lm_head"
+                base_model, "generator_lm_head"
             )
             else "classifier",
         )
-        grouped_results = list(
-            itertools.groupby(full_results, key=lambda x: x["doc_number"])
-        )
-        grouped_results = [list(group) for _, group in grouped_results]
+        
+        grouped_results = [
+            list(group) 
+            for _, group in itertools.groupby(
+                full_results, 
+                key=lambda x: x["doc_number"]
+            )
+        ]
 
         for i, batch in tqdm(
             enumerate(batch_generator(grouped_results, batch_size)),
@@ -2075,9 +2172,29 @@ def main(
             total=len(grouped_results) + batch_size - 1 // batch_size,
         ):
             texts = [L[0]["original_text"] for L in batch]
-            entity_embeddings = [[d["entity_embeddings"] for d in L] for L in batch]
-            entity_eigenvectors = [[d["entity_eigenvectors"] for d in L] for L in batch]
-            step_sizes = [[d["step_size"] for d in L] for L in batch]
+            # Eigenvector rows are capped at max_tokens_per_entity per entity,
+            # so cap the embeddings the same way: each eigenvector element must
+            # match the corresponding embedding element except for the
+            # eigenvector axis, i.e. (len_entity, num_eigenvectors, 768) vs
+            # (len_entity, 768).
+            entity_embeddings = [
+                [
+                    torch.as_tensor(
+                        d["e_i_embeddings"][: len(d["e_i_eigenvectors"])]
+                        + d["e_j_embeddings"][: len(d["e_j_eigenvectors"])]
+                    )
+                    for d in L
+                ]
+                for L in batch
+            ]
+            entity_eigenvectors = [
+                [
+                    torch.as_tensor(d["e_i_eigenvectors"] + d["e_j_eigenvectors"])
+                    for d in L
+                ]
+                for L in batch
+            ]
+            step_sizes = [[np.array(d['e_i_radii'] + d['e_j_radii']).max()**(1/2) for d in L] for L in batch]
             full_results_mbrd.extend(
                 mbr_batch(
                     texts,
@@ -2085,14 +2202,14 @@ def main(
                     entity_embeddings,
                     entity_eigenvectors,
                     step_sizes,
-                    num_pseudorefs=10,
+                    num_pseudorefs=8,
                     work_device=train_device,
                 )
             )
 
             print(f"Processed {len(full_results_mbrd)} examples", flush=True)
             with open(
-                f"../results/tacred_scores_{model_name.replace('/', '___')}_mbrd.json",
+                f"../results/{dataset_short_name}_scores_{model_short_name}_{timestamp}_mbrd.json",
                 "w",
                 encoding="utf-8",
             ) as f:
@@ -2101,6 +2218,7 @@ def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset-name", type=str, default="xiaobendanyn/tacred")
     parser.add_argument("--test", action="store_true", default=False)
     parser.add_argument("--model-name", type=str, default="tanaos/tanaos-NER-v1")
     parser.add_argument("--mbrd", action="store_true", default=False)
@@ -2109,7 +2227,24 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     devices = args.device.split("-") if args.device is not None else None
+
+    if args.dataset_name == "xiaobendanyn/tacred":
+        get_text = lambda x: x["token"]
+        get_heads = lambda x: x["h"]
+        get_tails = lambda x: x["t"]
+        get_relations = lambda x: x["relation"]
+    elif args.dataset_name == "DFKI-SLT/nyt-multi":
+        get_text = lambda x: " ".join(x["tokens"])
+        get_heads = lambda x: [spo[0] for spo in x["spo_list"]]
+        get_tails = lambda x: [spo[2] for spo in x["spo_list"]]
+        get_relations = lambda x: [spo[1] for spo in x["spo_list"]]
+
     main(
+        dataset_name=args.dataset_name,
+        get_text=get_text,
+        get_heads=get_heads,
+        get_tails=get_tails,
+        get_relations=get_relations,
         test=args.test,
         model_name=args.model_name,
         with_mbrd=args.mbrd,

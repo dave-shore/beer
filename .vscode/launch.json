@@ -6,34 +6,22 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Python: transcoder training",
-            "type": "debugpy",
-            "python": "/home/is/davide-r/.pyenv/versions/3.12.8/envs/beer/bin/python3",
-            "cwd": "/home/is/davide-r/beer",
-            "request": "launch",
-            "program": "transcoder_training.py",
-            "console": "internalConsole",
-            "justMyCode": true
-        },
-        {
             "name": "Python: scoring",
-            "type": "python",
-            "request": "attach",
-            "connect": {
-                "host": "elm81",
-                "port": 5678
-            },
-            "justMyCode": false
-        },
-        {
-            "name": "Llama scoring",
-            "type": "python",
-            "request": "attach",
-            "connect": {
-                "host": "elm44",
-                "port": 5678
-            },
-            "justMyCode": false
+            "type": "debugpy",
+            "python": "/data/shared/pyenv/versions/3.12.1/envs/beer/bin/python3",
+            "cwd": "${workspaceFolder}/src/mbeer",
+            "request": "launch",
+            "program": "scoring.py",
+            "console": "internalConsole",
+            "justMyCode": false,
+            "args": [
+                "--dataset-name",
+                "xiaobendanyn/tacred",
+                "--model-name",
+                "numind/NuNER-v2.0",
+                "--mbrd",
+                "--test",
+            ]
         }
     ]
 }

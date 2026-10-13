@@ -312,8 +312,11 @@ def chebyshev_filter_rank_estimate(
 def estimate_pdet(
     eigenvalues: torch.Tensor,
     det_regularization: float | str | None = "auto",
-    min_rank: int | None = None,
+    min_rank: int = 1,
 ) -> torch.Tensor:
+
+    if torch.all(eigenvalues.sum(dim = -1) == 0):
+        raise ValueError("Sum of eigenvalues is zero")
 
     tr_rad_ratio = eigenvalues.sum(dim=-1) / (eigenvalues[..., 0] + EPS)
     tr_sq_rad_ratio = eigenvalues.pow(2).sum(dim=-1) / (
@@ -326,10 +329,14 @@ def estimate_pdet(
     pade_approx = pade_approx.sum(dim=-1)
     d = eigenvalues.shape[-1]
 
-    # Mid-point coefficient estimate for the pseudo-determinant
-    rk_est = tr_sq_rad_ratio.reciprocal()
+    # Participation-ratio estimate of the effective rank:
+    # (Σλ)² / Σλ² = tr_rad_ratio² / tr_sq_rad_ratio ∈ [1, d]. The previous
+    # `tr_sq_rad_ratio.reciprocal()` was ≤ 1 by construction, so the clamp
+    # below always saturated it to `min_rank` and the rank estimate carried no
+    # information about the spectrum.
+    rk_est = tr_rad_ratio.pow(2) / (tr_sq_rad_ratio + EPS)
     rk_est = torch.clamp(
-        rk_est, min=min_rank if min_rank is not None else 1, max=d
+        rk_est.ceil() + min_rank, min=0, max=d-1
     ).unsqueeze(-1)
 
     # Smallest strictly-positive value of this dtype; used as a floor so that
@@ -341,10 +348,10 @@ def estimate_pdet(
         # saturates to `d`, making the exponent `1 / (d - rk_est)` blow up to
         # +inf and `eps ** inf == 0`. Clamp the denominator and the result so
         # the regularizer stays strictly positive.
-        denom = (d - rk_est).clamp(min=1.0)
+        denom = d - rk_est
         det_regularization = (
             torch.finfo(eigenvalues.dtype).eps ** (1.0 / denom)
-        ).clamp(min=tiny)
+        ).clamp(min=tiny*torch.ones_like(denom), max = eigenvalues[..., [0]] + EPS)
     elif det_regularization is None:
         det_regularization = torch.tensor(
             tiny, dtype=eigenvalues.dtype, device=eigenvalues.device
@@ -368,16 +375,16 @@ def estimate_pdet(
         + (1 - det_regularization) * pade_approx.unsqueeze(-1)
     )
 
-    general_ub = (eigenvalues.sum(dim=-1, keepdim=True) / rk_est) ** rk_est
+    general_ub = eigenvalues.sum(dim=-1, keepdim=True) ** rk_est
 
     lb = torch.exp(log_lb)
     lb = torch.clamp(
         lb,
-        min=EPS * torch.ones_like(lb),
-        max=torch.maximum(EPS * torch.ones_like(lb), general_ub),
+        min=torch.zeros_like(lb),
+        max=general_ub,
     ).nan_to_num(nan=0.0)
     ub = torch.exp(log_ub)
-    ub = torch.clamp(ub, min=lb, max=torch.maximum(lb, general_ub)).nan_to_num(nan=0.0)
+    ub = torch.clamp(ub, min=lb, max=general_ub).nan_to_num(nan=0.0)
 
     special_pdets = torch.where(torch.isfinite(ub), (ub + lb) / 2, lb)
 
@@ -620,6 +627,12 @@ def pullback(
     idx_indep_J = pred_id[::3]
     idx_indep_pair = pred_id[2::3]
 
+    # Separators are (start, end_exclusive) index pairs into the row's
+    # position list. `y.index(x[-1]) + 1` makes the end bound exclusive-
+    # inclusive of the last token; the previous `y.index(x[-1])` dropped the
+    # entity's final token and produced an *empty* slice for single-token
+    # entities. The mismatch fallbacks must also cover the whole batch, not a
+    # single row.
     if len(eq_class_emb_ids[::3]) > 0 and any(
         len(y) > 0 for y in eq_class_emb_ids[::3]
     ):
@@ -627,16 +640,16 @@ def pullback(
             x[0] in y and x[-1] in y for x, y in zip(idx_indep_I, eq_class_emb_ids[::3])
         ):
             sep_indep_I = [
-                (y.index(x[0]), y.index(x[-1]))
+                (y.index(x[0]), y.index(x[-1]) + 1)
                 for x, y in zip(idx_indep_I, eq_class_emb_ids[::3])
             ]
         else:
             warnings.warn(
                 "Positions in pred_ids and eq_class_emb_ids do not match for I"
             )
-            sep_indep_I = [(0, 1)]
+            sep_indep_I = [(0, 1)] * len(idx_indep_I)
     else:
-        sep_indep_I = [(0, 1)]
+        sep_indep_I = [(0, 1)] * len(idx_indep_I)
     if len(eq_class_emb_ids[1::3]) > 0 and any(
         len(y) > 0 for y in eq_class_emb_ids[1::3]
     ):
@@ -645,19 +658,22 @@ def pullback(
             for x, y in zip(idx_indep_J, eq_class_emb_ids[1::3])
         ):
             sep_indep_J = [
-                (y.index(x[0]), y.index(x[-1]))
+                (y.index(x[0]), y.index(x[-1]) + 1)
                 for x, y in zip(idx_indep_J, eq_class_emb_ids[1::3])
             ]
         else:
             warnings.warn(
                 "Positions in pred_ids and eq_class_emb_ids do not match for J"
             )
-            sep_indep_J = [(0, 1)]
+            sep_indep_J = [(0, 1)] * len(idx_indep_J)
     else:
-        sep_indep_J = [(0, 1)]
+        sep_indep_J = [(0, 1)] * len(idx_indep_J)
 
+    # For the pair rows, tup[0] is the index where entity j's block starts
+    # within the pair's position list (entity i's sampled positions come
+    # first, then entity j's).
     sep_indep_pair = [
-        (y.index(x[0]), y.index(x[-1])) for x, y in zip(idx_indep_I, idx_indep_pair)
+        (y.index(x[0]), y.index(x[-1]) + 1) for x, y in zip(idx_indep_I, idx_indep_pair)
     ]
 
     jac_I_num, jac_J_num, jac_I_den, jac_J_den = torch.chunk(jac, 4, dim=-2)
@@ -678,9 +694,14 @@ def pullback(
         batch_first=True,
         padding_value=0,
     )
+    # Split the pair row's Jacobian between the two entities at the *start*
+    # of entity j's block (tup[0]): positions [:tup[0]] belong to entity i and
+    # [tup[0]:] to entity j. The previous split at the index of entity j's
+    # last token assigned almost all of entity j's positions to entity i's
+    # denominator and left entity j with a single position.
     jac_I_den = torch.nn.utils.rnn.pad_sequence(
         [
-            jac_I_den.flatten(start_dim=2)[i, : tup[1], :]
+            jac_I_den.flatten(start_dim=2)[i, : tup[0], :]
             for i, tup in enumerate(sep_indep_pair)
         ],
         batch_first=True,
@@ -688,7 +709,7 @@ def pullback(
     )
     jac_J_den = torch.nn.utils.rnn.pad_sequence(
         [
-            jac_J_den.flatten(start_dim=2)[i, tup[1] :, :]
+            jac_J_den.flatten(start_dim=2)[i, tup[0] :, :]
             for i, tup in enumerate(sep_indep_pair)
         ],
         batch_first=True,
@@ -769,9 +790,12 @@ def pullback(
         jac_t = torch.transpose(jac, -2, -1)
         # jac_t.shape = (batch_size*max_len*max_len_pred_ids, embedding_size, selected_vocab_size)
 
-        tmp = torch.bmm(jac_t, g_flat).to(dtype=torch.float64)
+        # Accumulate the Gram matrices in float32 even when the model runs in
+        # float16: casting the *result* of an fp16 bmm (previous behaviour)
+        # keeps the fp16 accumulation error.
+        tmp = torch.bmm(jac_t.to(dtype=torch.float32), g_flat.to(dtype=torch.float32))
         # tmp.shape = (batch_size*max_len*max_len_pred_ids, embedding_size, selected_vocab_size)
-        pullback_metric = torch.bmm(tmp, jac.to(dtype=torch.float64))
+        pullback_metric = torch.bmm(tmp, jac.to(dtype=torch.float32))
         # pullback_metric.shape = (batch_size*max_len*max_len_pred_ids, embedding_size, embedding_size)
 
         # Pairing i|j and j|i, then getting back to the original batch size.
@@ -812,14 +836,18 @@ def pullback(
             )
 
         else:
-            eigenvalues, eigenvectors = torch.linalg.eigh(pullback_metric)
+            try:
+                eigenvalues, eigenvectors = torch.linalg.eigh(pullback_metric)
+            except torch._C._LinAlgError:
+                eigenvalues, eigenvectors = torch.linalg.eigh(pullback_metric.to(dtype=torch.float64))
 
         # eigenvalues.shape = (batch_size, max_len, max_len, R)
         # eigenvectors.shape = (batch_size, max_len, max_len, embedding_size, R)
-        eigenvalues = eigenvalues.flip(dims=(-1,)).to(dtype=torch.get_default_dtype())
-        eigenvectors = eigenvectors.flip(dims=(-1, -2)).to(
-            dtype=torch.get_default_dtype()
-        )
+        # Keep the spectra in float32 even when the default dtype is float16:
+        # the small eigenvalues that drive the pseudo-determinant are below
+        # fp16 resolution, and EPS is a float32 epsilon.
+        eigenvalues = eigenvalues.flip(dims=(-1,)).to(dtype=torch.float32)
+        eigenvectors = eigenvectors.flip(dims=(-1,)).to(dtype=torch.float32)
 
         if return_trace:
             num_eigenvectors = (
@@ -852,7 +880,7 @@ def pullback(
             # `pad_traces_and_eigenvectors` (cat along dim 0 instead of stacking),
             # mangling its first dimension. Squeeze it so all three line up.
             special_pdets = estimate_pdet(
-                eigenvalues, det_regularization=det_regularization, min_rank=min_rank
+                eigenvalues, det_regularization=det_regularization, min_rank=1
             ).squeeze(-1)
 
             eigenvector_index = (
@@ -870,10 +898,14 @@ def pullback(
                 torch.zeros_like(eigenvectors),
             ).transpose(-1, -2)
             max_index = num_eigenvectors.max().item()
-            eigenvector_index = eigenvector_index[..., :max_index, :]
-            eigenvectors = torch.gather(
-                eigenvectors, dim=-2, index=eigenvector_index
-            ).reshape(*eigenvectors.shape[:-2], -1, eigenvectors.shape[-1])
+            # Select the leading `max_index` eigenvectors along dim -2 (the
+            # eigenvector axis after the transpose above), leaving the embedding
+            # axis (dim -1, size embedding_size) untouched. The previous
+            # `torch.gather(..., dim=-2, index=eigenvector_index)` used an index
+            # whose values ran along the embedding axis, so it filled every
+            # eigenvector slot with the diagonal entries instead of selecting
+            # whole eigenvectors.
+            eigenvectors = eigenvectors[..., :max_index, :]
 
             # shapes:
             # special_pdets.shape = (batch_size, max_len, max_pred_ids)

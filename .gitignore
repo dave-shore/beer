@@ -223,3 +223,16 @@ __marimo__/
 *.pkl.tar.zip
 *.out
 slurm*
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.ico
+*.webp
+*.svg
+*.eps
+*/hftoken
+*.log

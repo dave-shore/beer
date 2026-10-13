@@ -88,9 +88,10 @@ def _preprocess_batch(
     )  # shape = (batch_size, 1, max_len, embedding_size)
     embedding_size = embedded_batch.shape[-1]
 
-    # m_ratios should apply only to the entity spans
+    # m_ratios should apply only to the entity spans. Sort for a
+    # deterministic player/row order (set order is arbitrary).
     entity_spans = [
-        list(set(sum([list(combo) for combo in combo_list], [])))
+        sorted(set(sum([list(combo) for combo in combo_list], [])))
         for combo_list in entity_span_combinations
     ]
 
@@ -120,10 +121,18 @@ def _preprocess_batch(
         torch.linspace(0, 1, M + 1)
         .reshape(1, -1, 1, 1)
         .tile(extended_embedded_batch.shape[0], 1, max_len, 1)
-    )  # shape = (1, M+1)
-    for i, span_list in enumerate(entity_spans):
-        for span in span_list:
-            m_ratios[i, :, span[0] : span[1]] = 1.0
+    )  # shape = (expanded_rows, M+1, max_len, 1)
+    # Pin every entity span of the row's parent document at ratio 1 so only
+    # the context is interpolated. `m_ratios` has one row per *expanded* row
+    # (entities + pairs per document), so the per-document span lists must be
+    # expanded accordingly; indexing by document (the previous behaviour)
+    # only pinned the first `len(entity_spans)` rows.
+    row_idx = 0
+    for spans_of_doc, n_rows in zip(entity_spans, repetitions.tolist()):
+        for _ in range(n_rows):
+            for span in spans_of_doc:
+                m_ratios[row_idx, :, span[0] : span[1]] = 1.0
+            row_idx += 1
 
     extended_embedded_batch = (
         (extended_embedded_batch * m_ratios.to(extended_embedded_batch.device))
@@ -318,23 +327,30 @@ def mean_integrated_directional_gradients(
     ).unsqueeze(1)
 
     grad_dot_products = torch.sum(X * J, dim=-1)
+    # One chunk of (M+1) interpolation steps per *expanded row*. Per document
+    # the rows are ordered [entity_1, ..., entity_n, pair_1, ..., pair_k]
+    # (see `compute_pred_ids_and_eq_class_emb_ids`), so each pair must be
+    # scored from its own pair row; the previous zip paired chunk k (the k-th
+    # expanded row overall) with document k, misaligning every document after
+    # the first. In a pair row both the prediction and the perturbation axes
+    # list entity i's sampled positions followed by entity j's, so the
+    # interaction block is [i-rows, j-columns].
     chunks = torch.split(grad_dot_products, M + 1, dim=0)
     mean_integrated_gradients = []
-    for chunk, combo_list, span_list in zip(
-        chunks, entity_span_combinations, entity_spans
-    ):
-        idg = chunk.mean(dim=0)
-        deltas = [end - start for start, end in span_list]
-        span_map = {
-            span: slice(
-                sum(deltas[:i]) if i > 0 else 0,
-                sum(deltas[: i + 1]) if i < len(span_list) - 1 else sum(deltas),
+    row_offset = 0
+    for combo_list, span_list in zip(entity_span_combinations, entity_spans):
+        n_entities = len(span_list)
+        for p, (span_i, span_j) in enumerate(combo_list):
+            idg = chunks[row_offset + n_entities + p].mean(dim=0)
+            len_i = min(max_tokens_per_entity, span_i[1] - span_i[0], idg.shape[0])
+            len_j = min(
+                max_tokens_per_entity, span_j[1] - span_j[0], idg.shape[1] - len_i
             )
-            for i, span in enumerate(sorted(span_list))
-        }
-        for combo in combo_list:
-            mean_idg = torch.mean(idg[span_map[combo[0]], span_map[combo[1]]])
-            mean_integrated_gradients.append(mean_idg)
+            block = idg[:len_i, len_i : len_i + len_j]
+            mean_integrated_gradients.append(
+                block.mean() if block.numel() > 0 else idg.mean()
+            )
+        row_offset += n_entities + len(combo_list)
 
     return torch.stack(mean_integrated_gradients)
 
@@ -705,8 +721,10 @@ def shapley_interaction_quantification(
             verbose=verbose,
         )
 
-        if budget is None:
-            budget = min(2**game.n_players, 2048)
+        # Resolve the budget per game: assigning to `budget` here would make
+        # the (possibly tiny) budget computed for the first sentence persist
+        # for every later sentence regardless of its number of players.
+        game_budget = budget if budget is not None else min(2**game.n_players, 2048)
 
         approximator = KernelSHAPIQ(
             n=game.n_players,
@@ -715,6 +733,6 @@ def shapley_interaction_quantification(
             pairing_trick=True,
             random_state=random_state,
         )
-        interaction_values = approximator.approximate(budget=budget, game=game)
+        interaction_values = approximator.approximate(budget=game_budget, game=game)
 
         yield interaction_values.get_n_order_values(max_order)

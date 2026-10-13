@@ -9,7 +9,7 @@ from mbrs.modules.als import MatrixFactorizationALS
 import ot.unbalanced as otu
 import torch
 from tqdm.auto import tqdm
-from transformers import AutoModel, AutoModelForMaskedLM, AutoTokenizer
+from transformers import AutoModel, AutoModelForMaskedLM, AutoModelForTokenClassification, AutoTokenizer
 
 class QKScore(torch.nn.Module):
     def __init__(
@@ -214,22 +214,24 @@ class CustomMetric(Metric):
 
     def __init__(self, cfg):
 
-        self.device = (
+        # `MetricBase.device` is a read-only property, so the device is kept
+        # in a private attribute and exposed through an overriding property.
+        self._device = torch.device(
             "cuda"
             if torch.cuda.is_available()
             else "mps" if torch.backends.mps.is_available() else "cpu"
         )
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.model_name_or_path)
-        self.model = AutoModelForMaskedLM.from_pretrained(cfg.model_name_or_path).to(
+        self.model = AutoModelForTokenClassification.from_pretrained(cfg.model_name_or_path).to(
             self.device
         )
-        self.embedder = getattr(self.model, cfg.embedding_module_name)
+        self.embedder = getattr(self.model.base_model, cfg.embedding_module_name)
         self.unembedder = UnEmbedder(
             self.embedder,
             self.tokenizer.vocab_size,
             self.model.config.max_position_embeddings,
         ).to(self.device)
-        self.encoder = getattr(self.model, cfg.encoder_module_name)
+        self.encoder = getattr(self.model.base_model, cfg.encoder_module_name)
         self.classifier = getattr(self.model, cfg.classifier_module_name).to("cpu")
         self.alignment = getattr(otu, cfg.alignment_type)
         self.alignment_kwargs = (
@@ -242,6 +244,10 @@ class CustomMetric(Metric):
         )
 
         super().__init__(cfg)
+
+    @property
+    def device(self) -> torch.device:
+        return self._device
 
     def score(
         self,
@@ -367,7 +373,7 @@ class CustomMetric(Metric):
         Returns:
             Tensor of shape (batch_size,) with per-sample mean scores.
         """
-        references = [(torch.squeeze(r[0]), torch.squeeze(r[1])) for r in references]
+        
 
         # --- 1. Batch tokenize sources and hypotheses ---
         tokenized_sources = self.tokenizer(
@@ -378,7 +384,7 @@ class CustomMetric(Metric):
             return_tensors="pt",
         )
         tokenized_hypothesis = self.tokenizer(
-            hypothesis, add_special_tokens=False, return_tensors="pt"
+            hypothesis, padding = True, truncation = True, add_special_tokens=False, return_tensors="pt"
         )
 
         with torch.inference_mode():
@@ -388,52 +394,68 @@ class CustomMetric(Metric):
             )
             embedded_hypotheses = self.embedder(
                 tokenized_hypothesis.input_ids.to(self.device)
-            ).reshape(1, -1, embedded_sources.shape[-1])
+            )
+            # shape = (num_hypotheses, max_len, embedding_size)
             embedding_size = embedded_hypotheses.shape[-1]
 
             mask_embedding = self.embedder(
-                torch.tensor([self.tokenizer.mask_token_id], device=self.device)
-            ).reshape(1, embedding_size)
+                torch.tensor([self.tokenizer.mask_token_id], device=self.device).unsqueeze(0)
+            ).reshape(1, 1, embedding_size)
 
             # --- 3. Build per-sample variable-length sequences ---
+            references = [
+                next(filter(lambda r: r is not None, refs))
+            for refs in references]
             triples: List[torch.Tensor] = []
             sources_emb: List[torch.Tensor] = []
             masked_tails: List[torch.Tensor] = []
 
-            hp_len = int(tokenized_hypothesis.attention_mask.sum())
+            hp_len = tokenized_hypothesis.attention_mask.sum(dim = 1)
+            real_batch_size = min(batch_size, len(references))
 
-            for i in range(batch_size):
-                src_len = int(tokenized_sources.attention_mask[i].sum())
+            for i in range(real_batch_size):
                 ref1, ref2 = references[i]
+                R = min(ref1.shape[0], ref2.shape[0])
+                src_len = min(ref1.shape[1], ref2.shape[1])
 
-                hp_emb = embedded_hypotheses[i, :hp_len]
+                if ref1 is None:
+                    ref1 = torch.zeros(1, src_len, embedding_size)
+                if ref2 is None:
+                    ref2 = torch.zeros(1, src_len, embedding_size)
+
+                ref1 = ref1[:R,:src_len].to(self.device).repeat(embedded_hypotheses.shape[0], 1, 1)
+                ref2 = ref2[:R,:src_len].to(self.device).repeat(embedded_hypotheses.shape[0], 1, 1)
+
+                hp_emb = embedded_hypotheses.repeat_interleave(R, dim=0)
                 src_emb = embedded_sources[i, :src_len]
 
-                triples.append(torch.cat([ref1, hp_emb, ref2], dim=0))
+                triples.append(torch.cat([ref1, hp_emb, ref2], dim=1))
                 sources_emb.append(src_emb)
                 masked_tails.append(
                     torch.cat(
-                        [ref1, hp_emb, torch.ones_like(ref2) * mask_embedding], dim=0
+                        [ref1, hp_emb, torch.ones_like(ref2) * mask_embedding], dim=1
                     )
                 )
 
             # Interleave as [triple_0, src_0, masked_0, triple_1, src_1, masked_1, ...]
             interleaved: List[torch.Tensor] = []
-            for i in range(batch_size):
+            for i in range(real_batch_size):
                 interleaved.extend([triples[i], sources_emb[i], masked_tails[i]])
 
             seq_lengths = [s.shape[0] for s in interleaved]
 
-            # --- 4. Single encoder forward pass over all 3 * batch_size sequences ---
+            # --- 4. Single encoder forward pass over all 3 * num_eigenvectors * batch_size sequences ---
             padded = torch.nn.utils.rnn.pad_sequence(interleaved, batch_first=True).to(
                 self.device
-            )
-            # shape: (3 * batch_size, max_seq_len, embedding_size)
+            ).transpose(1,2).flatten(end_dim=1)
+            # shape: (3 * batch_size * num_eigenvectors, max_seq_len, embedding_size)
 
             output = self.encoder(padded).last_hidden_state.cpu()
-            # shape: (3 * batch_size, max_seq_len, hidden_size)
+            # shape: (3 * batch_size * num_eigenvectors, max_seq_len, hidden_size)
 
-        padded_cpu = padded.cpu()
+        padded_cpu = padded.cpu().unflatten(dim=0, sizes=(3 * batch_size, -1))
+        output = output.unflatten(dim=0, sizes=(3 * batch_size, -1))
+        # shape: (3 * batch_size, num_eigenvectors, max_seq_len, hidden_size)
 
         # --- 5. Per-sample score computation ---
         moverscore_list: List[torch.Tensor] = []
@@ -458,7 +480,7 @@ class CustomMetric(Metric):
             costs = self.alignment(
                 a=torch.where(pad_triple.sum(dim=1) > 0, 1, 0).numpy(),
                 b=torch.where(pad_source.sum(dim=1) > 0, 1, 0).numpy(),
-                M=pair_dists,
+                M=pair_dists.cpu().numpy(),
                 **self.alignment_kwargs,
             )
             A = costs.argmax(dim=1).unsqueeze(1)
@@ -645,8 +667,8 @@ class BatchProbabilisticMBR(DecoderProbabilisticMBR):
 
             for n in range(0, N, batch_size):
                 reference_samples = [
-                    [references[m][j] for j in reference_sample_indices]
-                    for m in range(n, n + batch_size)
+                    [references[m][j] if j < len(references[m]) else None for j in reference_sample_indices]
+                    for m in range(n, min(n + batch_size, N))
                 ]
                 triwise_scores[
                     n : n + batch_size,
@@ -698,6 +720,13 @@ class BatchProbabilisticMBR(DecoderProbabilisticMBR):
             DecoderMBR.Output: The n-best hypotheses.
         """
 
+        if not isinstance(references, list):
+            references = list(references)
+        if not isinstance(sources, list):
+            sources = list(sources)
+        if not isinstance(hypotheses, list):
+            hypotheses = list(hypotheses)
+
         if self.cfg.reduction_factor <= 1.0:
             expected_scores = self.metric.expected_scores(
                 hypotheses, references, sources, reference_lprobs=reference_lprobs
@@ -747,7 +776,7 @@ class RelationDisambiguation:
         )
         self.metric = CustomMetric(metric_cfg)
         decoder_cfg = DecoderProbabilisticMBR.Config()
-        self.decoder = DecoderProbabilisticMBR(decoder_cfg, self.metric)
+        self.decoder = BatchProbabilisticMBR(decoder_cfg, self.metric)
 
         self.hypotheses = hypotheses
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -785,7 +814,7 @@ class RelationDisambiguation:
             pseudorefs,
             sources,
             nbest=self.topk,
-            batch_size=self.topkbatch_size,
+            batch_size=self.batch_size,
         )
 
         return output
